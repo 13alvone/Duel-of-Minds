@@ -6,14 +6,16 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from array import array
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from topics import Theme, TopicGraph
@@ -136,6 +138,37 @@ def fetch_recent_context(conn: sqlite3.Connection, run_id: int, k: int) -> List[
     rows = cur.fetchall()
     rows.reverse()
     return [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+
+def insert_growth_metric(
+    conn: sqlite3.Connection,
+    run_id: int,
+    turn_index: int,
+    novelty_score: float,
+    max_similarity: Optional[float],
+    method: str,
+    threshold: Optional[float],
+    attempt_count: int,
+    flagged: bool,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO growth_metrics (run_id, turn_index, novelty_score, max_similarity, method, threshold, attempt_count, flagged, created_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            turn_index,
+            float(novelty_score),
+            None if max_similarity is None else float(max_similarity),
+            method,
+            None if threshold is None else float(threshold),
+            int(max(attempt_count, 0)),
+            1 if flagged else 0,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
 
 
 def upsert_fact(
@@ -979,6 +1012,36 @@ class MemoryManager:
         store = self._ensure_store(len(vector))
         store.sync(self.run_id, turn_index, blob)
 
+    def embed_text(self, text: str) -> Optional[List[float]]:
+        if self._embedding_backend is None:
+            return None
+        try:
+            vectors = self._embedding_backend.embed_texts([text])  # type: ignore[call-arg]
+        except Exception as exc:
+            logging.debug("[DEBUG] Embed text failed: %s", exc)
+            return None
+        if not vectors or not vectors[0]:
+            return None
+        return [float(v) for v in vectors[0]]
+
+    def recent_embeddings(self, limit: int) -> List[Tuple[int, List[float]]]:
+        if limit <= 0 or self._embedding_backend is None:
+            return []
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn_index, embedding FROM message_embeddings WHERE run_id=? ORDER BY turn_index DESC LIMIT ?",
+            (self.run_id, limit),
+        )
+        rows = cur.fetchall()
+        results: List[Tuple[int, List[float]]] = []
+        for row in rows:
+            blob = row["embedding"] if isinstance(row, sqlite3.Row) else row[1]
+            if blob is None:
+                continue
+            vector = _blob_to_vector(bytes(blob)) if not isinstance(blob, (bytes, bytearray)) else _blob_to_vector(blob)
+            results.append((int(row["turn_index"] if isinstance(row, sqlite3.Row) else row[0]), vector))
+        return results
+
     def semantic_recall(
         self,
         query_text: str,
@@ -1039,6 +1102,107 @@ class MemoryManager:
         if len(compact) <= limit:
             return compact
         return compact[:limit] + "…"
+
+
+@dataclass
+class NoveltyAssessment:
+    score: float
+    best_similarity: float
+    method: str
+
+    def passed(self, threshold: float) -> bool:
+        return self.score >= threshold
+
+
+@dataclass
+class GenerationResult:
+    content: str
+    novelty: float
+    similarity: float
+    method: str
+    attempts: int
+    flagged: bool
+
+
+class NoveltyScorer:
+    def __init__(self, memory: MemoryManager, recent_window: int = 10) -> None:
+        self.memory = memory
+        self.recent_window = max(1, recent_window)
+
+    def assess(self, candidate: str, recent_texts: Sequence[str]) -> NoveltyAssessment:
+        cleaned = candidate.strip()
+        if not cleaned:
+            return NoveltyAssessment(score=0.0, best_similarity=1.0, method="empty")
+        windowed_texts = [text for text in list(recent_texts)[-self.recent_window :] if text.strip()]
+        assessments: List[NoveltyAssessment] = []
+        embed_assessment = self._embedding_assessment(cleaned)
+        if embed_assessment is not None:
+            assessments.append(embed_assessment)
+        hash_assessment = self._hash_assessment(cleaned, windowed_texts)
+        if hash_assessment is not None:
+            assessments.append(hash_assessment)
+        if not assessments:
+            return NoveltyAssessment(score=1.0, best_similarity=0.0, method="default")
+        best = max(assessments, key=lambda item: item.score)
+        if len(assessments) > 1:
+            logging.debug(
+                "[DEBUG] Novelty assessments %s -> selected %s",
+                [(item.method, item.score, item.best_similarity) for item in assessments],
+                (best.method, best.score, best.best_similarity),
+            )
+        return best
+
+    def _embedding_assessment(self, candidate: str) -> Optional[NoveltyAssessment]:
+        vector = self.memory.embed_text(candidate)
+        if vector is None:
+            return None
+        previous = self.memory.recent_embeddings(self.recent_window)
+        if not previous:
+            return NoveltyAssessment(score=1.0, best_similarity=0.0, method="embedding")
+        best_similarity = 0.0
+        for _, other_vector in previous:
+            if not other_vector:
+                continue
+            similarity = max(min(_cosine_similarity(vector, other_vector), 1.0), -1.0)
+            best_similarity = max(best_similarity, similarity)
+        score = max(0.0, 1.0 - best_similarity)
+        return NoveltyAssessment(score=score, best_similarity=best_similarity, method="embedding")
+
+    def _hash_assessment(self, candidate: str, recent_texts: Sequence[str]) -> Optional[NoveltyAssessment]:
+        if not recent_texts:
+            return NoveltyAssessment(score=1.0, best_similarity=0.0, method="hash")
+        shingles = self._shingles(candidate)
+        if not shingles:
+            return NoveltyAssessment(score=0.0, best_similarity=1.0, method="hash")
+        best_similarity = 0.0
+        for text in recent_texts:
+            other_shingles = self._shingles(text)
+            if not other_shingles:
+                continue
+            union = len(shingles | other_shingles)
+            if union == 0:
+                continue
+            similarity = len(shingles & other_shingles) / float(union)
+            if similarity > best_similarity:
+                best_similarity = similarity
+        score = max(0.0, 1.0 - best_similarity)
+        return NoveltyAssessment(score=score, best_similarity=best_similarity, method="hash")
+
+    def _shingles(self, text: str) -> Set[str]:
+        tokens = self._tokenize(text)
+        if not tokens:
+            return set()
+        if len(tokens) < 3:
+            return set(tokens)
+        shingles: Set[str] = set()
+        size = 3
+        for idx in range(len(tokens) - size + 1):
+            shingles.add(" ".join(tokens[idx : idx + size]))
+        return shingles
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        return [tok for tok in re.split(r"[^a-z0-9]+", text.lower()) if tok]
 
     @staticmethod
     def _extract_fact_snippets(content: str, limit: int = 2) -> List[str]:
@@ -1139,6 +1303,7 @@ class DuelEngine:
             )
         self._start_monotonic: Optional[float] = None
         self._max_regen_attempts = 2
+        self._novelty_scorer = NoveltyScorer(self.memory, recent_window=12)
 
     def signal_handler(self, *_: Any) -> None:
         logging.warning("[!] Caught signal; finishing current turn and stopping.")
@@ -1226,20 +1391,12 @@ class DuelEngine:
         ctx = fetch_recent_context(self.db, self.run_id, k=10)
         return [content for _, _, content in ctx]
 
-    def _novelty_score(self, text: str) -> float:
-        if not text.strip():
-            return 0.0
-        prior = " ".join(self._recent_texts()).lower()
-        if not prior.strip():
-            return 1.0
-        prior_words = set(prior.split())
-        words = [w for w in text.lower().split() if w]
-        if not words:
-            return 0.0
-        novel = [w for w in words if w not in prior_words]
-        return len(novel) / len(words)
+    def _flagged_message(self, novelty: float) -> str:
+        return (
+            f"(novelty_flag: score={novelty:.3f} < threshold={self.novelty_threshold:.3f})"
+        )
 
-    def _generate_turn(self, next_speaker: str) -> str:
+    def _generate_turn(self, next_speaker: str) -> GenerationResult:
         history_rows = fetch_recent_context(self.db, self.run_id, k=self.short_ctx_turns)
         topic_guidance = self._topic_guidance_text()
         system_prompt = self._system_for(next_speaker, topic_guidance)
@@ -1250,14 +1407,74 @@ class DuelEngine:
             user_prompt += "\n\n[Memory]\n" + recall_block
         logging.debug(f"[DEBUG] System prompt for {next_speaker} is {len(system_prompt)} chars.")
         logging.debug(f"[DEBUG] User prompt length={len(user_prompt)} chars.")
-        raw = self.backend.generate(
-            system_prompt, user_prompt, self.stopwords,
-            self.temperature, self.top_p, self.max_tokens, self.repeat_penalty
+
+        max_attempts = 1 if not self.growth_checks else (self._max_regen_attempts + 1)
+        attempts = 0
+        final_content = ""
+        candidate = ""
+        assessment = NoveltyAssessment(score=1.0, best_similarity=0.0, method="default")
+        flagged = False
+        recent_texts = self._recent_texts()
+
+        while attempts < max_attempts:
+            attempts += 1
+            raw = self.backend.generate(
+                system_prompt,
+                user_prompt,
+                self.stopwords,
+                self.temperature,
+                self.top_p,
+                self.max_tokens,
+                self.repeat_penalty,
+            )
+            raw = truncate_tokens(raw, self.max_reply_chars)
+            if self.ngram_block_n > 1:
+                raw = ngram_block(raw, recent_texts, self.ngram_block_n)
+            candidate = raw.strip()
+            assessment = self._novelty_scorer.assess(candidate, recent_texts)
+            logging.debug(
+                "[DEBUG] Turn attempt %d by %s: novelty %.3f (method=%s, similarity=%.3f)",
+                attempts,
+                next_speaker,
+                assessment.score,
+                assessment.method,
+                assessment.best_similarity,
+            )
+            if not self.growth_checks:
+                final_content = candidate
+                break
+            if assessment.passed(self.novelty_threshold):
+                final_content = candidate
+                break
+            if attempts >= max_attempts:
+                flagged = True
+                final_content = self._flagged_message(assessment.score)
+                logging.warning(
+                    "[!] Novelty %.3f below threshold %.3f after %d attempts; inserting flag.",
+                    assessment.score,
+                    self.novelty_threshold,
+                    attempts,
+                )
+                break
+            logging.warning(
+                "[!] Novelty %.3f below threshold %.3f; regenerating (attempt %d/%d).",
+                assessment.score,
+                self.novelty_threshold,
+                attempts,
+                max_attempts,
+            )
+
+        if not final_content.strip():
+            final_content = candidate.strip() or "(…)"
+
+        return GenerationResult(
+            content=final_content,
+            novelty=assessment.score,
+            similarity=assessment.best_similarity,
+            method=assessment.method,
+            attempts=attempts,
+            flagged=flagged,
         )
-        raw = truncate_tokens(raw, self.max_reply_chars)
-        if self.ngram_block_n > 1:
-            raw = ngram_block(raw, self._recent_texts(), self.ngram_block_n)
-        return raw.strip()
 
     def run(self, start_turn_index: int, max_turns: int) -> None:
         # Alternate speakers: even turn -> A, odd -> B (or continue based on last message)
@@ -1283,36 +1500,54 @@ class DuelEngine:
             self._maybe_pivot_topic()
             next_speaker = self.speaker_a if current_turn % 2 == 0 else self.speaker_b
             try:
-                attempts = 0
-                reply = ""
-                novelty = 0.0
-                while attempts <= self._max_regen_attempts:
-                    reply = self._generate_turn(next_speaker)
-                    novelty = self._novelty_score(reply)
-                    if not self.growth_checks or novelty >= self.novelty_threshold:
-                        break
-                    attempts += 1
-                    logging.warning(
-                        f"[!] Novelty score {novelty:.3f} below threshold {self.novelty_threshold:.3f}; regenerating (attempt {attempts})."
-                    )
-                if self.growth_checks and novelty < self.novelty_threshold:
-                    logging.warning(
-                        f"[!] Proceeding with reply below novelty threshold ({novelty:.3f} < {self.novelty_threshold:.3f})."
-                    )
-                if not reply:
-                    logging.warning("[!] Empty reply received; inserting '(…)' and continuing.")
-                    reply = "(…)"
+                result = self._generate_turn(next_speaker)
+                reply = result.content.strip() or "(…)"
                 insert_message(self.db, self.run_id, current_turn, next_speaker, reply)
                 logging.info(f"[i] Turn {current_turn} by {next_speaker} stored ({len(reply)} chars).")
                 self.memory.record_turn(current_turn, next_speaker, reply, self._current_theme_id)
-                if self.growth_checks:
-                    logging.debug(f"[DEBUG] Novelty score for turn {current_turn}: {novelty:.3f}")
+                if result.flagged:
+                    logging.warning(
+                        "[!] Growth check flag inserted on turn %d (score %.3f < %.3f).",
+                        current_turn,
+                        result.novelty,
+                        self.novelty_threshold,
+                    )
+                elif self.growth_checks:
+                    logging.debug(
+                        "[DEBUG] Novelty %.3f via %s (similarity=%.3f, attempts=%d) for turn %d.",
+                        result.novelty,
+                        result.method,
+                        result.similarity,
+                        result.attempts,
+                        current_turn,
+                    )
+                insert_growth_metric(
+                    self.db,
+                    self.run_id,
+                    current_turn,
+                    result.novelty,
+                    result.similarity,
+                    result.method,
+                    self.novelty_threshold if self.growth_checks else None,
+                    result.attempts,
+                    result.flagged,
+                )
             except Exception as e:
                 logging.error(f"[x] Generation failed on turn {current_turn}: {e}")
-                # Insert an explicit defect marker and continue
                 fallback = f"(generation_error: {e})"
                 insert_message(self.db, self.run_id, current_turn, next_speaker, fallback)
                 self.memory.record_turn(current_turn, next_speaker, fallback, self._current_theme_id)
+                insert_growth_metric(
+                    self.db,
+                    self.run_id,
+                    current_turn,
+                    0.0,
+                    None,
+                    "error",
+                    self.novelty_threshold if self.growth_checks else None,
+                    0,
+                    False,
+                )
             finally:
                 self._turns_since_pivot += 1
 

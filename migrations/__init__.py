@@ -94,6 +94,27 @@ MIGRATIONS: Iterable[Migration] = (
             ON message_embeddings(run_id, turn_index DESC);
         """,
     ),
+    (
+        "0003_growth_metrics",
+        """
+        CREATE TABLE IF NOT EXISTS growth_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            turn_index INTEGER NOT NULL,
+            novelty_score REAL NOT NULL,
+            max_similarity REAL,
+            method TEXT NOT NULL,
+            threshold REAL,
+            attempt_count INTEGER NOT NULL,
+            flagged INTEGER NOT NULL DEFAULT 0,
+            created_at_utc TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES runs(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_growth_run_turn
+            ON growth_metrics(run_id, turn_index);
+        """,
+    ),
 )
 
 
