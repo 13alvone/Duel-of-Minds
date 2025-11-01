@@ -1,18 +1,55 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
 import logging
+import math
 import os
 import random
 import signal
 import sqlite3
 import sys
 import time
+from array import array
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from topics import Theme, TopicGraph
+
+# Optional scientific stacks
+try:
+    import numpy as _np  # type: ignore
+
+    _HAS_NUMPY = True
+except Exception:
+    _HAS_NUMPY = False
+
+try:
+    import faiss  # type: ignore
+
+    _HAS_FAISS = True
+except Exception:
+    _HAS_FAISS = False
+
+# Optional: ONNX runtime + tokenizers for MiniLM embeddings
+try:
+    import onnxruntime as ort  # type: ignore
+
+    _HAS_ONNXRUNTIME = True
+except Exception:
+    _HAS_ONNXRUNTIME = False
+
+try:
+    from tokenizers import Tokenizer  # type: ignore
+
+    _HAS_TOKENIZERS = True
+except Exception:
+    _HAS_TOKENIZERS = False
+
+# Local helpers
+from migrations import run_migrations
 
 # Optional: llama.cpp backend
 try:
@@ -54,35 +91,14 @@ def setup_logging(verbosity: int) -> None:
 # ---------------------------
 # SQLite schema and helpers
 # ---------------------------
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at_utc TEXT NOT NULL,
-    backend TEXT NOT NULL,
-    model_name TEXT NOT NULL,
-    persona_a_path TEXT NOT NULL,
-    persona_b_path TEXT NOT NULL,
-    params_json TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER NOT NULL,
-    turn_index INTEGER NOT NULL,
-    speaker TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at_utc TEXT NOT NULL,
-    FOREIGN KEY(run_id) REFERENCES runs(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_run_turn ON messages(run_id, turn_index);
-"""
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.executescript(SCHEMA)
+    run_migrations(conn)
     return conn
 
 def insert_run(conn: sqlite3.Connection, backend: str, model_name: str,
@@ -111,15 +127,162 @@ def fetch_last_turn(conn: sqlite3.Connection, run_id: int) -> int:
     row = cur.fetchone()
     return int(row[0]) if row and row[0] is not None else -1
 
-def fetch_recent_context(conn: sqlite3.Connection, run_id: int, k: int) -> List[Tuple[str, str]]:
+def fetch_recent_context(conn: sqlite3.Connection, run_id: int, k: int) -> List[Tuple[int, str, str]]:
     cur = conn.cursor()
     cur.execute(
-        "SELECT speaker, content FROM messages WHERE run_id=? ORDER BY turn_index DESC LIMIT ?",
+        "SELECT turn_index, speaker, content FROM messages WHERE run_id=? ORDER BY turn_index DESC LIMIT ?",
         (run_id, k),
     )
     rows = cur.fetchall()
     rows.reverse()
-    return rows
+    return [(int(row[0]), str(row[1]), str(row[2])) for row in rows]
+
+
+def upsert_fact(
+    conn: sqlite3.Connection,
+    run_id: int,
+    subject: str,
+    predicate: str,
+    obj: str,
+    turn_id: int,
+    confidence: float,
+) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO facts (run_id, subject, predicate, object, turn_id, confidence, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, subject, predicate, object)
+            DO UPDATE SET
+                turn_id=excluded.turn_id,
+                confidence=excluded.confidence,
+                updated_at_utc=excluded.updated_at_utc
+            """,
+            (run_id, subject, predicate, obj, turn_id, confidence, timestamp, timestamp),
+        )
+
+
+def upsert_theme(
+    conn: sqlite3.Connection,
+    run_id: int,
+    theme_key: str,
+    strength: float,
+    turn_id: int,
+) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO themes (run_id, theme, strength, last_seen_turn, created_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, theme)
+            DO UPDATE SET
+                strength=excluded.strength,
+                last_seen_turn=excluded.last_seen_turn,
+                updated_at_utc=excluded.updated_at_utc
+            """,
+            (run_id, theme_key, strength, turn_id, timestamp, timestamp),
+        )
+
+
+def upsert_summary(conn: sqlite3.Connection, run_id: int, step: int, content: str) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO summaries (run_id, step, content, created_at_utc)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(run_id, step)
+            DO UPDATE SET
+                content=excluded.content,
+                created_at_utc=excluded.created_at_utc
+            """,
+            (run_id, step, content, timestamp),
+        )
+
+
+def latest_summary(conn: sqlite3.Connection, run_id: int) -> str:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT content FROM summaries WHERE run_id=? ORDER BY step DESC LIMIT 1",
+        (run_id,),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else ""
+
+
+def fetch_fact_snippets(conn: sqlite3.Connection, run_id: int, limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT subject, predicate, object, turn_id, confidence
+        FROM facts
+        WHERE run_id=?
+        ORDER BY confidence DESC, turn_id DESC
+        LIMIT ?
+        """,
+        (run_id, limit),
+    )
+    return [
+        {
+            "subject": str(row[0]),
+            "predicate": str(row[1]),
+            "object": str(row[2]),
+            "turn_id": int(row[3]),
+            "confidence": float(row[4]),
+        }
+        for row in cur.fetchall()
+    ]
+
+
+def fetch_theme_rows(conn: sqlite3.Connection, run_id: int, limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT theme, strength, last_seen_turn
+        FROM themes
+        WHERE run_id=?
+        ORDER BY strength DESC, last_seen_turn DESC
+        LIMIT ?
+        """,
+        (run_id, limit),
+    )
+    return [
+        {
+            "theme": str(row[0]),
+            "strength": float(row[1]),
+            "last_seen_turn": int(row[2]),
+        }
+        for row in cur.fetchall()
+    ]
+
+
+def fetch_recent_summaries(conn: sqlite3.Connection, run_id: int, limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT step, content
+        FROM summaries
+        WHERE run_id=?
+        ORDER BY step DESC
+        LIMIT ?
+        """,
+        (run_id, limit),
+    )
+    return [
+        {
+            "step": int(row[0]),
+            "content": str(row[1]),
+        }
+        for row in cur.fetchall()
+    ]
 
 
 # ---------------------------
@@ -133,6 +296,12 @@ class BackendBase:
 
     def name(self) -> str:
         raise NotImplementedError
+
+    def supports_embeddings(self) -> bool:
+        return False
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        raise NotImplementedError("Embedding backend not available")
 
 
 class LlamaCppBackend(BackendBase):
@@ -167,6 +336,16 @@ class LlamaCppBackend(BackendBase):
 
     def name(self) -> str:
         return "llamacpp"
+
+    def supports_embeddings(self) -> bool:
+        return True
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        embeddings: List[List[float]] = []
+        for text in texts:
+            result = self.llm.create_embedding(input=text)  # type: ignore[arg-type]
+            embeddings.append(list(result["data"][0]["embedding"]))
+        return embeddings
 
 
 class OpenAICompatBackend(BackendBase):
@@ -206,6 +385,9 @@ class OpenAICompatBackend(BackendBase):
 
     def name(self) -> str:
         return f"openai_compat:{self.model}"
+
+    def supports_embeddings(self) -> bool:
+        return False
 
 
 # ---------------------------
@@ -338,6 +520,545 @@ def parse_pause_jitter_arg(value: str) -> Tuple[float, float]:
 
 
 # ---------------------------
+# Memory + vector store plumbing
+# ---------------------------
+
+
+def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
+    dot = sum(x * y for x, y in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(x * x for x in vec_a))
+    norm_b = math.sqrt(sum(y * y for y in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _vector_to_blob(vector: Sequence[float]) -> bytes:
+    arr = array("f", [float(v) for v in vector])
+    return arr.tobytes()
+
+
+def _blob_to_vector(blob: bytes) -> List[float]:
+    arr = array("f")
+    arr.frombytes(blob)
+    return list(arr)
+
+
+class HashEmbeddingBackend:
+    """Deterministic hashing fallback when no high-quality embedder is available."""
+
+    def __init__(self, dimension: int = 64) -> None:
+        self.dimension = dimension
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for text in texts:
+            values: List[float] = []
+            token = text.strip() or "(empty)"
+            for index in range(self.dimension):
+                digest = hashlib.sha256(f"{token}|{index}".encode("utf-8")).digest()
+                int_val = int.from_bytes(digest[:4], "big", signed=False)
+                scaled = (int_val / 0xFFFFFFFF) * 2.0 - 1.0
+                values.append(float(scaled))
+            vectors.append(values)
+        return vectors
+
+
+class OnnxMiniLMEmbedding:
+    """Wrapper around an ONNX MiniLM encoder (if local files and deps are present)."""
+
+    def __init__(self, model_path: str) -> None:
+        if not (_HAS_ONNXRUNTIME and _HAS_TOKENIZERS and _HAS_NUMPY):
+            raise RuntimeError("onnxruntime, tokenizers, and numpy are required for ONNX embeddings.")
+        if os.path.isdir(model_path):
+            model_file = os.path.join(model_path, "model.onnx")
+            tokenizer_file = os.path.join(model_path, "tokenizer.json")
+        else:
+            base = os.path.dirname(model_path)
+            model_file = model_path
+            tokenizer_file = os.path.join(base, "tokenizer.json")
+        if not os.path.exists(model_file):
+            raise FileNotFoundError(model_file)
+        if not os.path.exists(tokenizer_file):
+            raise FileNotFoundError(tokenizer_file)
+        self._session = ort.InferenceSession(model_file, providers=["CPUExecutionProvider"])  # type: ignore[arg-type]
+        self._tokenizer = Tokenizer.from_file(tokenizer_file)
+        output = self._session.get_outputs()[0]
+        try:
+            self.dimension = int(output.shape[-1])
+        except Exception:
+            self.dimension = 384
+
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for text in texts:
+            encoded = self._tokenizer.encode(text)
+            input_ids = _np.array([encoded.ids], dtype=_np.int64)  # type: ignore[call-arg]
+            attention = _np.ones_like(input_ids, dtype=_np.int64)
+            outputs = self._session.run(None, {"input_ids": input_ids, "attention_mask": attention})
+            vector = outputs[0][0]
+            vectors.append(vector.astype(_np.float32).tolist())
+        return vectors
+
+
+class VectorStoreBase:
+    def sync(self, run_id: int, turn_index: int, embedding_blob: bytes) -> None:
+        raise NotImplementedError
+
+    def search(
+        self,
+        run_id: int,
+        query_embedding: Sequence[float],
+        topk: int,
+        *,
+        exclude_turn: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+
+class SimpleVectorStore(VectorStoreBase):
+    """Fallback cosine-similarity store implemented directly over SQLite."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def sync(self, run_id: int, turn_index: int, embedding_blob: bytes) -> None:
+        # Data already written to message_embeddings; nothing further required.
+        return
+
+    def _fetch_rows(self, run_id: int, limit: int) -> List[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT turn_index, speaker, content, embedding FROM message_embeddings WHERE run_id=? ORDER BY turn_index DESC LIMIT ?",
+            (run_id, limit),
+        )
+        rows = []
+        for turn_index, speaker, content, blob in cur.fetchall():
+            if blob is None:
+                continue
+            vector = _blob_to_vector(blob)
+            rows.append(
+                {
+                    "turn_index": int(turn_index),
+                    "speaker": str(speaker),
+                    "content": str(content),
+                    "vector": vector,
+                }
+            )
+        return rows
+
+    def search(
+        self,
+        run_id: int,
+        query_embedding: Sequence[float],
+        topk: int,
+        *,
+        exclude_turn: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if topk <= 0:
+            return []
+        rows = self._fetch_rows(run_id, max(topk * 8, 32))
+        query = list(query_embedding)
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            if exclude_turn is not None and row["turn_index"] == exclude_turn:
+                continue
+            vector = row["vector"]
+            if len(vector) != len(query) or not vector:
+                continue
+            score = _cosine_similarity(query, vector)
+            results.append(
+                {
+                    "turn_index": row["turn_index"],
+                    "speaker": row["speaker"],
+                    "content": row["content"],
+                    "score": float(score),
+                }
+            )
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results[:topk]
+
+
+class FaissVectorStore(SimpleVectorStore):
+    """FAISS-accelerated similarity search if available."""
+
+    def __init__(self, conn: sqlite3.Connection, dim: int) -> None:
+        if not (_HAS_FAISS and _HAS_NUMPY):
+            raise RuntimeError("FAISS requires faiss and numpy modules.")
+        super().__init__(conn)
+        self.dim = dim
+
+    def search(
+        self,
+        run_id: int,
+        query_embedding: Sequence[float],
+        topk: int,
+        *,
+        exclude_turn: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if topk <= 0:
+            return []
+        rows = self._fetch_rows(run_id, max(topk * 8, 64))
+        if not rows:
+            return []
+        matrix = _np.array([row["vector"] for row in rows], dtype=_np.float32)
+        if matrix.shape[1] != self.dim:
+            return super().search(run_id, query_embedding, topk, exclude_turn=exclude_turn)
+        query = _np.array([query_embedding], dtype=_np.float32)
+        if query.shape[1] != self.dim:
+            return super().search(run_id, query_embedding, topk, exclude_turn=exclude_turn)
+        faiss.normalize_L2(matrix)
+        faiss.normalize_L2(query)
+        index = faiss.IndexFlatIP(self.dim)
+        index.add(matrix)
+        scores, indices = index.search(query, min(topk, matrix.shape[0]))
+        results: List[Dict[str, Any]] = []
+        for rank, idx in enumerate(indices[0]):
+            row = rows[idx]
+            if exclude_turn is not None and row["turn_index"] == exclude_turn:
+                continue
+            results.append(
+                {
+                    "turn_index": row["turn_index"],
+                    "speaker": row["speaker"],
+                    "content": row["content"],
+                    "score": float(scores[0][rank]),
+                }
+            )
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results[:topk]
+
+
+class SqliteVSSVectorStore(SimpleVectorStore):
+    """SQLite-VSS wrapper (if extension available)."""
+
+    def __init__(self, conn: sqlite3.Connection, dim: int) -> None:
+        super().__init__(conn)
+        self.dim = dim
+        try:
+            conn.enable_load_extension(True)
+            conn.execute("SELECT vss_version()")
+        except Exception as exc:
+            raise RuntimeError("sqlite-vss extension not available") from exc
+        with conn:
+            conn.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS message_embeddings_vss USING vss0(embedding({dim}))")
+
+    def _lookup_rowid(self, run_id: int, turn_index: int) -> Optional[int]:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT rowid FROM message_embeddings WHERE run_id=? AND turn_index=?",
+            (run_id, turn_index),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else None
+
+    def sync(self, run_id: int, turn_index: int, embedding_blob: bytes) -> None:
+        rowid = self._lookup_rowid(run_id, turn_index)
+        if rowid is None:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO message_embeddings_vss(rowid, embedding) VALUES (?, ?)",
+                    (rowid, sqlite3.Binary(embedding_blob)),
+                )
+        except sqlite3.DatabaseError as exc:
+            logging.debug("[DEBUG] sqlite-vss sync failed: %s", exc)
+
+    def search(
+        self,
+        run_id: int,
+        query_embedding: Sequence[float],
+        topk: int,
+        *,
+        exclude_turn: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if topk <= 0:
+            return []
+        try:
+            query_blob = sqlite3.Binary(_vector_to_blob(query_embedding))
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT m.turn_index, m.speaker, m.content, v.distance
+                FROM message_embeddings_vss v
+                JOIN message_embeddings m ON m.rowid = v.rowid
+                WHERE m.run_id=? AND v.embedding MATCH ?
+                ORDER BY v.distance ASC
+                LIMIT ?
+                """,
+                (run_id, query_blob, max(topk * 3, topk)),
+            )
+            rows = cur.fetchall()
+        except sqlite3.DatabaseError as exc:
+            logging.debug("[DEBUG] sqlite-vss search failed: %s", exc)
+            return super().search(run_id, query_embedding, topk, exclude_turn=exclude_turn)
+        results: List[Dict[str, Any]] = []
+        for turn_index, speaker, content, distance in rows:
+            turn = int(turn_index)
+            if exclude_turn is not None and turn == exclude_turn:
+                continue
+            score = 1.0 / (1.0 + float(distance))
+            results.append(
+                {
+                    "turn_index": turn,
+                    "speaker": str(speaker),
+                    "content": str(content),
+                    "score": score,
+                }
+            )
+        if not results:
+            return super().search(run_id, query_embedding, topk, exclude_turn=exclude_turn)
+        results.sort(key=lambda item: item["score"], reverse=True)
+        return results[:topk]
+
+
+class VectorStoreFactory:
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+
+    def create(self, dim: int) -> VectorStoreBase:
+        try:
+            store = SqliteVSSVectorStore(self.conn, dim)
+            logging.info("[i] Using sqlite-vss vector store (%d dims).", dim)
+            return store
+        except Exception as exc:
+            logging.debug("[DEBUG] sqlite-vss unavailable: %s", exc)
+        if _HAS_FAISS and _HAS_NUMPY:
+            try:
+                store = FaissVectorStore(self.conn, dim)
+                logging.info("[i] Using FAISS vector store fallback (%d dims).", dim)
+                return store
+            except Exception as exc:
+                logging.debug("[DEBUG] FAISS fallback unavailable: %s", exc)
+        logging.info("[i] Using simple cosine vector store (%d dims).", dim)
+        return SimpleVectorStore(self.conn)
+
+
+class MemoryManager:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        run_id: int,
+        backend: BackendBase,
+        db_path: str,
+        embedding_model: str,
+        recall_topk: int,
+        recall_alpha: float,
+    ) -> None:
+        self.conn = conn
+        self.run_id = run_id
+        self.backend = backend
+        self.db_path = db_path
+        self.recall_topk = max(0, recall_topk)
+        self.recall_alpha = min(max(recall_alpha, 0.0), 1.0)
+        self._embedding_model = (embedding_model or "auto").strip()
+        self._embedding_backend = self._init_embedding_backend()
+        self._store_factory = VectorStoreFactory(conn)
+        self._vector_store: Optional[VectorStoreBase] = None
+        self._theme_cache: Dict[str, float] = {}
+
+    def _init_embedding_backend(self) -> Any:
+        token = self._embedding_model.lower()
+        if token in {"", "off", "none"}:
+            logging.info("[i] Embedding pipeline disabled.")
+            return None
+        if token in {"auto"}:
+            if self.backend.supports_embeddings():
+                logging.info("[i] Using llama.cpp embeddings via active backend.")
+                return self.backend
+            pipeline = self._load_default_minilm()
+            if pipeline:
+                logging.info("[i] Loaded default MiniLM ONNX embeddings.")
+                return pipeline
+        elif token in {"llamacpp"}:
+            if self.backend.supports_embeddings():
+                logging.info("[i] Using requested llama.cpp embedding mode.")
+                return self.backend
+            logging.warning("[!] llama.cpp embeddings requested but backend does not support them.")
+        elif token in {"minilm-onnx", "minilm", "onnx"}:
+            pipeline = self._load_default_minilm()
+            if pipeline:
+                logging.info("[i] Loaded MiniLM ONNX embeddings (default search).")
+                return pipeline
+        if token not in {"auto", "llamacpp", "minilm-onnx", "minilm", "onnx", "off", "none"}:
+            candidate = self._embedding_model
+            if os.path.exists(candidate):
+                try:
+                    pipeline = OnnxMiniLMEmbedding(candidate)
+                    logging.info("[i] Loaded ONNX embeddings from %s.", candidate)
+                    return pipeline
+                except Exception as exc:
+                    logging.warning("[!] Failed to load ONNX embeddings from %s: %s", candidate, exc)
+        if self.backend.supports_embeddings():
+            logging.info("[i] Falling back to llama.cpp embeddings.")
+            return self.backend
+        logging.warning("[!] Falling back to deterministic hash embeddings.")
+        return HashEmbeddingBackend()
+
+    def _load_default_minilm(self) -> Optional[OnnxMiniLMEmbedding]:
+        candidates: List[str] = []
+        env_path = os.environ.get("DOM_MINILM_PATH") or os.environ.get("DOM_MINILM_DIR")
+        if env_path:
+            candidates.append(env_path)
+        repo_path = os.path.join(os.path.dirname(__file__), "data", "models", "minilm-onnx")
+        candidates.append(repo_path)
+        for path in candidates:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                return OnnxMiniLMEmbedding(path)
+            except Exception as exc:
+                logging.debug("[DEBUG] MiniLM load failed at %s: %s", path, exc)
+        return None
+
+    def latest_summary(self) -> str:
+        return latest_summary(self.conn, self.run_id)
+
+    def record_turn(self, turn_index: int, speaker: str, content: str, theme_key: Optional[str]) -> None:
+        if not content.strip():
+            return
+        self._store_facts(turn_index, speaker, content)
+        if theme_key:
+            self._update_theme(theme_key, turn_index)
+        self._store_embedding(turn_index, speaker, content)
+
+    def record_summary(self, step: int, content: str) -> None:
+        if not content.strip():
+            return
+        upsert_summary(self.conn, self.run_id, step, content)
+
+    def _store_facts(self, turn_index: int, speaker: str, content: str) -> None:
+        snippets = self._extract_fact_snippets(content)
+        for snippet in snippets:
+            confidence = 0.55 + min(len(snippet) / 400.0, 0.35)
+            upsert_fact(self.conn, self.run_id, speaker, "asserts", snippet, turn_index, confidence)
+
+    def _update_theme(self, theme_key: str, turn_index: int) -> None:
+        strength = self._theme_cache.get(theme_key)
+        if strength is None:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT strength FROM themes WHERE run_id=? AND theme=?",
+                (self.run_id, theme_key),
+            )
+            row = cur.fetchone()
+            strength = float(row[0]) if row else 0.0
+        strength = float(strength) + 1.0
+        self._theme_cache[theme_key] = strength
+        upsert_theme(self.conn, self.run_id, theme_key, strength, turn_index)
+
+    def _ensure_store(self, dim: int) -> VectorStoreBase:
+        if self._vector_store is None:
+            self._vector_store = self._store_factory.create(dim)
+        return self._vector_store
+
+    def _store_embedding(self, turn_index: int, speaker: str, content: str) -> None:
+        if self._embedding_backend is None:
+            return
+        try:
+            vectors = self._embedding_backend.embed_texts([content])  # type: ignore[call-arg]
+        except Exception as exc:
+            logging.debug("[DEBUG] Embedding generation failed: %s", exc)
+            return
+        if not vectors or not vectors[0]:
+            return
+        vector = vectors[0]
+        blob = _vector_to_blob(vector)
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO message_embeddings (run_id, turn_index, speaker, content, embedding, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, turn_index)
+                DO UPDATE SET speaker=excluded.speaker, content=excluded.content, embedding=excluded.embedding, created_at_utc=excluded.created_at_utc
+                """,
+                (self.run_id, turn_index, speaker, content, sqlite3.Binary(blob), timestamp),
+            )
+        store = self._ensure_store(len(vector))
+        store.sync(self.run_id, turn_index, blob)
+
+    def semantic_recall(
+        self,
+        query_text: str,
+        *,
+        exclude_turn: Optional[int],
+        topk: int,
+    ) -> List[Dict[str, Any]]:
+        if topk <= 0 or not query_text.strip():
+            return []
+        if self._vector_store is None or self._embedding_backend is None:
+            return []
+        try:
+            vectors = self._embedding_backend.embed_texts([query_text])  # type: ignore[call-arg]
+        except Exception as exc:
+            logging.debug("[DEBUG] Query embedding failed: %s", exc)
+            return []
+        if not vectors or not vectors[0]:
+            return []
+        return self._vector_store.search(self.run_id, vectors[0], topk, exclude_turn=exclude_turn)
+
+    def render_recall_block(self, history: Sequence[Tuple[int, str, str]], next_speaker: str) -> str:
+        if self.recall_topk <= 0:
+            return ""
+        query_turn = history[-1][0] if history else None
+        query_text = history[-1][2] if history else ""
+        semantic_quota = 0
+        if self._vector_store is not None and self._embedding_backend is not None:
+            semantic_quota = max(0, int(round(self.recall_topk * self.recall_alpha)))
+        semantic = self.semantic_recall(query_text, exclude_turn=query_turn, topk=semantic_quota) if semantic_quota else []
+        fact_quota = self.recall_topk - len(semantic)
+        facts = fetch_fact_snippets(self.conn, self.run_id, max(fact_quota, 0))
+        themes = fetch_theme_rows(self.conn, self.run_id, 3)
+        summaries = fetch_recent_summaries(self.conn, self.run_id, 2)
+        sections: List[str] = []
+        if semantic:
+            lines = [f"- Turn {item['turn_index']} ({item['speaker']}): {self._truncate(item['content'])}" for item in semantic]
+            sections.append("[Semantic recall]\n" + "\n".join(lines))
+        if facts:
+            lines = [
+                f"- {fact['subject']} {fact['predicate']} {self._truncate(fact['object'])} (turn {fact['turn_id']})"
+                for fact in facts
+            ]
+            sections.append("[Fact memory]\n" + "\n".join(lines))
+        if themes:
+            lines = [
+                f"- {row['theme']} (strength {row['strength']:.1f}, last turn {row['last_seen_turn']})"
+                for row in themes
+            ]
+            sections.append("[Theme tracker]\n" + "\n".join(lines))
+        if summaries:
+            lines = [f"- Turn {row['step']}: {self._truncate(row['content'], 320)}" for row in summaries]
+            sections.append("[Recent summaries]\n" + "\n".join(lines))
+        return "\n\n".join(section for section in sections if section).strip()
+
+    @staticmethod
+    def _truncate(text: str, limit: int = 220) -> str:
+        compact = " ".join(text.split())
+        if len(compact) <= limit:
+            return compact
+        return compact[:limit] + "…"
+
+    @staticmethod
+    def _extract_fact_snippets(content: str, limit: int = 2) -> List[str]:
+        clean = content.replace("\n", " ").strip()
+        if not clean:
+            return []
+        sentences: List[str] = []
+        for segment in clean.replace("?", ".").split("."):
+            candidate = segment.strip()
+            if len(candidate) < 8:
+                continue
+            sentences.append(candidate)
+            if len(sentences) >= limit:
+                break
+        if not sentences:
+            sentences.append(clean)
+        return sentences[:limit]
+
+
+# ---------------------------
 # Main conversational engine
 # ---------------------------
 class DuelEngine:
@@ -363,6 +1084,10 @@ class DuelEngine:
                  pause_jitter: Tuple[float, float],
                  growth_checks: bool,
                  novelty_threshold: float,
+                 recall_topk: int,
+                 recall_alpha: float,
+                 embedding_model: str,
+                 db_path: str,
                  topic_graph: Optional["TopicGraph"] = None,
                  topic_pivot_interval: int = 0):
         self.backend = backend
@@ -382,7 +1107,16 @@ class DuelEngine:
         self.ngram_block_n = ngram_block_n
         self.summary_every = summary_every
         self.summary_chars = summary_chars
-        self.long_summary = ""  # rolling summary we refresh periodically
+        self.memory = MemoryManager(
+            conn=db,
+            run_id=run_id,
+            backend=backend,
+            db_path=db_path,
+            embedding_model=embedding_model,
+            recall_topk=recall_topk,
+            recall_alpha=recall_alpha,
+        )
+        self.long_summary = self.memory.latest_summary()  # rolling summary we refresh periodically
         self._shutdown = False
         self.max_wallclock_seconds = max_wallclock_seconds
         self.pause_jitter = pause_jitter
@@ -410,18 +1144,19 @@ class DuelEngine:
         logging.warning("[!] Caught signal; finishing current turn and stopping.")
         self._shutdown = True
 
-    def summarize_long_context(self) -> None:
+    def summarize_long_context(self, step: int) -> None:
         """Ask one of the personas to summarize the conversation so far, if backend available."""
         ctx = fetch_recent_context(self.db, self.run_id, k=200)
         if not ctx:
             return
         # Build a compact prompt to summarize themes and points of agreement/disagreement
         system = "You are a neutral summarizer. Extract main themes and disagreements. Be concise (<= 1200 chars)."
-        transcript = "\n".join([f"{s}: {c}" for s, c in ctx])
+        transcript = "\n".join([f"{speaker}: {content}" for _, speaker, content in ctx])
         user = "Summarize the above conversation’s key ideas, agreements, and disagreements succinctly."
         try:
             summary = self.backend.generate(system, user + "\n\n" + transcript[-8000:], [], 0.2, 0.95, 512, 1.0)
             self.long_summary = truncate_tokens(summary, self.summary_chars)
+            self.memory.record_summary(step, self.long_summary)
             logging.info("[i] Updated rolling summary.")
         except Exception as e:
             logging.warning(f"[!] Summary generation failed: {e}")
@@ -489,7 +1224,7 @@ class DuelEngine:
 
     def _recent_texts(self) -> List[str]:
         ctx = fetch_recent_context(self.db, self.run_id, k=10)
-        return [c for _, c in ctx]
+        return [content for _, _, content in ctx]
 
     def _novelty_score(self, text: str) -> float:
         if not text.strip():
@@ -505,10 +1240,14 @@ class DuelEngine:
         return len(novel) / len(words)
 
     def _generate_turn(self, next_speaker: str) -> str:
-        history = fetch_recent_context(self.db, self.run_id, k=self.short_ctx_turns)
+        history_rows = fetch_recent_context(self.db, self.run_id, k=self.short_ctx_turns)
         topic_guidance = self._topic_guidance_text()
         system_prompt = self._system_for(next_speaker, topic_guidance)
-        user_prompt = make_turn_prompt(history, next_speaker, self.stopwords, topic_guidance)
+        history_pairs = [(speaker, content) for _, speaker, content in history_rows]
+        user_prompt = make_turn_prompt(history_pairs, next_speaker, self.stopwords, topic_guidance)
+        recall_block = self.memory.render_recall_block(history_rows, next_speaker)
+        if recall_block:
+            user_prompt += "\n\n[Memory]\n" + recall_block
         logging.debug(f"[DEBUG] System prompt for {next_speaker} is {len(system_prompt)} chars.")
         logging.debug(f"[DEBUG] User prompt length={len(user_prompt)} chars.")
         raw = self.backend.generate(
@@ -531,6 +1270,7 @@ class DuelEngine:
             seed = "Let us begin: what do you take to be the primordial tension between freedom and meaning?"
             insert_message(self.db, self.run_id, 0, self.speaker_a, seed)
             logging.info(f"[i] Seeded opening by {self.speaker_a}.")
+            self.memory.record_turn(0, self.speaker_a, seed, self._current_theme_id)
             current_turn = 1
 
         self._start_monotonic = time.monotonic()
@@ -564,18 +1304,21 @@ class DuelEngine:
                     reply = "(…)"
                 insert_message(self.db, self.run_id, current_turn, next_speaker, reply)
                 logging.info(f"[i] Turn {current_turn} by {next_speaker} stored ({len(reply)} chars).")
+                self.memory.record_turn(current_turn, next_speaker, reply, self._current_theme_id)
                 if self.growth_checks:
                     logging.debug(f"[DEBUG] Novelty score for turn {current_turn}: {novelty:.3f}")
             except Exception as e:
                 logging.error(f"[x] Generation failed on turn {current_turn}: {e}")
                 # Insert an explicit defect marker and continue
-                insert_message(self.db, self.run_id, current_turn, next_speaker, f"(generation_error: {e})")
+                fallback = f"(generation_error: {e})"
+                insert_message(self.db, self.run_id, current_turn, next_speaker, fallback)
+                self.memory.record_turn(current_turn, next_speaker, fallback, self._current_theme_id)
             finally:
                 self._turns_since_pivot += 1
 
             # Periodic summarization to keep a rolling long-term memory
             if self.summary_every > 0 and current_turn % self.summary_every == 0:
-                self.summarize_long_context()
+                self.summarize_long_context(current_turn)
 
             if self.pause_jitter[1] > 0:
                 wait = random.uniform(self.pause_jitter[0], self.pause_jitter[1])
@@ -635,6 +1378,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pause-jitter", default="700,4000", help="Pause between turns in milliseconds as 'min,max'.")
     p.add_argument("--growth-checks", choices=["on", "off"], default="on", help="Enforce simple novelty checks each turn.")
     p.add_argument("--novelty-threshold", type=float, default=0.35, help="Minimum novelty ratio required when growth checks are on.")
+    p.add_argument("--recall-topk", type=int, default=6, help="Number of hybrid recall snippets to blend into prompts.")
+    p.add_argument("--recall-alpha", type=float, default=0.6, help="Semantic recall weight (0..1) vs. fact/theme recalls.")
+    p.add_argument(
+        "--embedding-model",
+        default="miniLM-onnx",
+        help="Embedding backend spec (auto|minilm-onnx|llamacpp|off or local path).",
+    )
     p.add_argument(
         "--topic-graph",
         default=DEFAULT_TOPIC_GRAPH,
@@ -671,6 +1421,12 @@ def main() -> None:
 
     if not 0.0 <= args.novelty_threshold <= 1.0:
         logging.error("[x] --novelty-threshold must be between 0.0 and 1.0.")
+        sys.exit(2)
+    if args.recall_topk < 0:
+        logging.error("[x] --recall-topk must be >= 0.")
+        sys.exit(2)
+    if not 0.0 <= args.recall_alpha <= 1.0:
+        logging.error("[x] --recall-alpha must be between 0.0 and 1.0.")
         sys.exit(2)
 
     growth_checks_enabled = args.growth_checks == "on"
@@ -784,6 +1540,9 @@ def main() -> None:
         "growth_checks": args.growth_checks,
         "growth_checks_enabled": growth_checks_enabled,
         "novelty_threshold": args.novelty_threshold,
+        "recall_topk": args.recall_topk,
+        "recall_alpha": args.recall_alpha,
+        "embedding_model": args.embedding_model,
         "gpu_layers_mode": gpu_layers_mode,
         "gpu_layers": gpu_layers_value,
         "topic_graph_path": topic_graph_path,
@@ -848,6 +1607,10 @@ def main() -> None:
         pause_jitter=pause_jitter,
         growth_checks=growth_checks_enabled,
         novelty_threshold=args.novelty_threshold,
+        recall_topk=args.recall_topk,
+        recall_alpha=args.recall_alpha,
+        embedding_model=args.embedding_model,
+        db_path=os.path.abspath(args.db_path),
         topic_graph=topic_graph,
         topic_pivot_interval=topic_pivot_interval,
     )
