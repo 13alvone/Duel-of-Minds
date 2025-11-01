@@ -22,6 +22,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple, TYPE_CHECKING
 
+from evaluation import EvaluationConfig, generate_reports
+
 if TYPE_CHECKING:
     from topics import Theme, TopicGraph
 
@@ -1956,6 +1958,68 @@ def parse_run_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def parse_eval_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="dom eval",
+        description="Replay stored transcripts to compute novelty metrics and leakage checks.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("db_path", help="Path to the SQLite database containing transcripts.")
+    p.add_argument(
+        "--run-id",
+        type=int,
+        action="append",
+        default=None,
+        help="Evaluate specific run id(s). Repeat to evaluate multiple runs.",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="Evaluate all runs in the database (overrides --run-id).",
+    )
+    p.add_argument(
+        "--output-root",
+        default=os.path.join(BASE_DIR, "outputs"),
+        help="Directory where evaluation artifacts will be written.",
+    )
+    p.add_argument(
+        "--matrix-label",
+        default="",
+        help="Optional label (e.g. 2h, 8h, 24h) to align reports with the testing matrix.",
+    )
+    p.add_argument(
+        "--limit-turns",
+        type=int,
+        default=0,
+        help="Limit evaluation to the first N turns (0 = all).",
+    )
+    p.add_argument(
+        "--quote-threshold",
+        type=int,
+        default=200,
+        help="Minimum quoted character count before flagging a potential leakage.",
+    )
+    p.add_argument(
+        "--tcr-stride",
+        type=int,
+        default=3,
+        help="Window size used when rendering Thesis–Critique–Revision snapshots.",
+    )
+    p.add_argument(
+        "--timestamp",
+        default="",
+        help="Optional timestamp label for deterministic output folder names (YYYYMMDD-HHMMSS).",
+    )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=1,
+        help="Increase logging verbosity (-v, -vv).",
+    )
+    return p.parse_args(argv)
+
+
 def parse_nuke_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="dom nuke",
@@ -1982,6 +2046,8 @@ def parse_cli(argv: Optional[Sequence[str]] = None) -> Tuple[str, argparse.Names
     tokens = list(sys.argv[1:] if argv is None else argv)
     if tokens and tokens[0].lower() == "nuke":
         return "nuke", parse_nuke_args(tokens[1:])
+    if tokens and tokens[0].lower() == "eval":
+        return "eval", parse_eval_args(tokens[1:])
     if tokens and tokens[0].lower() == "run":
         tokens = tokens[1:]
     return "run", parse_run_args(tokens)
@@ -2041,12 +2107,78 @@ def handle_nuke(args: argparse.Namespace) -> None:
         logging.debug(f"[DEBUG] {table}: deleted {count} row(s).")
 
 
+def _resolve_eval_run_ids(conn: sqlite3.Connection, args: argparse.Namespace) -> List[int]:
+    if args.all:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM runs ORDER BY id ASC")
+        run_ids = [int(row[0]) for row in cur.fetchall()]
+        return run_ids
+    if args.run_id:
+        ids = sorted({int(run_id) for run_id in args.run_id if run_id is not None and run_id > 0})
+        return ids
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return [int(row[0])] if row else []
+
+
+def handle_eval(args: argparse.Namespace) -> None:
+    db_path = os.path.abspath(args.db_path)
+    if not os.path.exists(db_path):
+        logging.error(f"[x] Database not found at {db_path}.")
+        sys.exit(2)
+    try:
+        conn = init_db(db_path)
+    except Exception as exc:
+        logging.error(f"[x] Failed to open database: {exc}")
+        sys.exit(2)
+
+    try:
+        run_ids = _resolve_eval_run_ids(conn, args)
+        if not run_ids:
+            logging.error("[x] No runs available for evaluation.")
+            sys.exit(2)
+        output_root = os.path.abspath(args.output_root)
+        os.makedirs(output_root, exist_ok=True)
+        timestamp = args.timestamp.strip() or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        limit_turns = args.limit_turns if args.limit_turns and args.limit_turns > 0 else None
+        matrix_label = args.matrix_label.strip() or None
+        quote_threshold = max(int(args.quote_threshold), 32)
+        tcr_stride = int(args.tcr_stride) if args.tcr_stride and args.tcr_stride > 0 else 3
+        config = EvaluationConfig(
+            output_root=output_root,
+            limit_turns=limit_turns,
+            matrix_label=matrix_label,
+            quote_threshold=quote_threshold,
+            tcr_stride=tcr_stride,
+            timestamp=timestamp,
+        )
+        failures = 0
+        for run_id in run_ids:
+            try:
+                result = generate_reports(conn, run_id, config)
+            except Exception as exc:
+                failures += 1
+                logging.error(f"[x] Evaluation failed for run {run_id}: {exc}")
+                continue
+            logging.info(f"[i] Evaluation artifacts for run {run_id} written to {result.output_dir}.")
+        if failures:
+            logging.error(f"[x] {failures} evaluation(s) failed.")
+            sys.exit(1)
+        logging.info(f"[i] Completed evaluation for {len(run_ids)} run(s).")
+    finally:
+        conn.close()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     command, args = parse_cli(argv)
     setup_logging(getattr(args, "verbose", 1))
 
     if command == "nuke":
         handle_nuke(args)
+        return
+    if command == "eval":
+        handle_eval(args)
         return
 
     try:
