@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import http.client
 import json
 import logging
 import math
@@ -8,9 +9,11 @@ import os
 import random
 import re
 import signal
+import socket
 import sqlite3
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass
 from array import array
 from collections import deque
@@ -19,6 +22,11 @@ from typing import Any, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tu
 
 if TYPE_CHECKING:
     from topics import Theme, TopicGraph
+
+try:
+    import tomllib  # type: ignore[attr-defined]
+except ModuleNotFoundError:  # pragma: no cover - Python <3.11 fallback
+    import tomli as tomllib  # type: ignore
 
 # Optional scientific stacks
 try:
@@ -68,9 +76,173 @@ except Exception:
     _HAS_REQUESTS = False
 
 
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+CONFIG_DIR = os.path.join(BASE_DIR, "config")
+MODELS_CONFIG_PATH = os.path.join(CONFIG_DIR, "models.toml")
+
 DEFAULT_TOPIC_GRAPH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "data", "topics", "existential_pivots.yaml")
+    os.path.join(BASE_DIR, "data", "topics", "existential_pivots.yaml")
 )
+
+_ZERO_NETWORK_GUARD_ENABLED = False
+_REQUESTS_GUARD_ACTIVE = False
+_MODEL_CHECKSUM_CACHE: Optional[Dict[str, str]] = None
+
+
+def _zero_network_error() -> RuntimeError:
+    return RuntimeError(
+        "Zero-network mode is enabled; outbound HTTP is blocked. "
+        "Rerun with --zero-network off to permit HTTP backends."
+    )
+
+
+def _raise_zero_network_error(*_args: Any, **_kwargs: Any) -> None:
+    raise _zero_network_error()
+
+
+def enable_zero_network_guard() -> None:
+    """Install runtime guards that prevent outbound HTTP access."""
+
+    global _ZERO_NETWORK_GUARD_ENABLED, _REQUESTS_GUARD_ACTIVE
+
+    if _ZERO_NETWORK_GUARD_ENABLED:
+        return
+
+    _ZERO_NETWORK_GUARD_ENABLED = True
+
+    # Guard urllib (used by many stdlib callers)
+    urllib.request.urlopen = _raise_zero_network_error  # type: ignore[assignment]
+
+    def _guarded_http_request(
+        self: http.client.HTTPConnection,
+        method: str,
+        url: str,
+        body: Any = None,
+        headers: Optional[Dict[str, Any]] = None,
+        *,
+        encode_chunked: bool = False,
+    ) -> None:
+        raise _zero_network_error()
+
+    http.client.HTTPConnection.request = _guarded_http_request  # type: ignore[assignment]
+    http.client.HTTPSConnection.request = _guarded_http_request  # type: ignore[assignment]
+
+    # Guard low-level socket creation to catch direct attempts
+    def _guarded_create_connection(*_args: Any, **_kwargs: Any) -> None:
+        raise _zero_network_error()
+
+    socket.create_connection = _guarded_create_connection  # type: ignore[assignment]
+
+    if _HAS_REQUESTS:
+        import requests  # type: ignore
+
+        if not _REQUESTS_GUARD_ACTIVE:
+            def _guarded_session_request(self: Any, method: str, url: str, *args: Any, **kwargs: Any) -> None:
+                raise _zero_network_error()
+
+            def _guarded_requests_call(*args: Any, **kwargs: Any) -> None:
+                raise _zero_network_error()
+
+            requests.sessions.Session.request = _guarded_session_request  # type: ignore[assignment]
+            for verb in ("request", "get", "post", "put", "delete", "head", "options", "patch"):
+                setattr(requests, verb, _guarded_requests_call)
+            _REQUESTS_GUARD_ACTIVE = True
+
+
+def _normalize_model_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _load_model_checksums(config_path: str = MODELS_CONFIG_PATH) -> Dict[str, str]:
+    """Load model path -> sha256 mappings from config/models.toml."""
+
+    global _MODEL_CHECKSUM_CACHE
+
+    if _MODEL_CHECKSUM_CACHE is not None:
+        return _MODEL_CHECKSUM_CACHE
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Model checksum config not found at {config_path}. Create it to list authorized models."
+        )
+
+    with open(config_path, "rb") as fh:
+        raw = tomllib.load(fh)
+
+    entries: Dict[str, str] = {}
+    models_section = raw.get("models")
+
+    def _register_entry(entry: Dict[str, Any], index: int) -> None:
+        path = entry.get("path")
+        checksum = entry.get("sha256")
+        if not path or not isinstance(path, str):
+            raise ValueError(f"models[{index}] is missing a 'path' string entry in {config_path}.")
+        if not checksum or not isinstance(checksum, str):
+            raise ValueError(f"models[{index}] is missing a 'sha256' string entry in {config_path}.")
+        entries[_normalize_model_path(path)] = checksum.lower()
+        # Support optional aliases for quick lookup
+        alias = entry.get("alias") or entry.get("id")
+        if alias and isinstance(alias, str):
+            entries[alias.strip().lower()] = checksum.lower()
+
+    if isinstance(models_section, list):
+        for idx, entry in enumerate(models_section):
+            if not isinstance(entry, dict):
+                raise ValueError(f"models[{idx}] must be a table in {config_path}.")
+            _register_entry(entry, idx)
+    elif isinstance(models_section, dict):
+        for idx, (key, value) in enumerate(models_section.items()):
+            if isinstance(value, dict):
+                value.setdefault("alias", key)
+                _register_entry(value, idx)
+            elif isinstance(value, str):
+                entries[_normalize_model_path(key)] = value.lower()
+            else:
+                raise ValueError(f"models.{key} must map to a string hash or table in {config_path}.")
+    else:
+        raise ValueError(f"config/models.toml must define a 'models' list or table.")
+
+    if not entries:
+        raise ValueError(f"No model checksum entries found in {config_path}.")
+
+    _MODEL_CHECKSUM_CACHE = entries
+    return entries
+
+
+def _compute_sha256(path: str, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            data = handle.read(chunk_size)
+            if not data:
+                break
+            digest.update(data)
+    return digest.hexdigest()
+
+
+def verify_model_checksum(model_path: str) -> None:
+    """Verify model binary integrity before loading llama.cpp."""
+
+    normalized_path = _normalize_model_path(model_path)
+    checksums = _load_model_checksums()
+
+    expected = checksums.get(normalized_path)
+    if expected is None:
+        # Allow lookup by alias based on basename for convenience
+        expected = checksums.get(os.path.basename(normalized_path))
+    if expected is None:
+        raise RuntimeError(
+            f"No checksum entry found for model '{normalized_path}' in {MODELS_CONFIG_PATH}."
+        )
+
+    actual = _compute_sha256(normalized_path)
+    if actual.lower() != expected.lower():
+        raise RuntimeError(
+            f"Model checksum mismatch for '{normalized_path}'. Expected "
+            f"{expected.lower()}, computed {actual.lower()}."
+        )
+
+    logging.info(f"[i] Verified SHA256 for model {normalized_path}.")
 
 
 # ---------------------------
@@ -345,6 +517,7 @@ class LlamaCppBackend(BackendBase):
         if not os.path.exists(model_path):
             logging.error(f"[x] Model path does not exist: {model_path}")
             raise FileNotFoundError(model_path)
+        verify_model_checksum(model_path)
         logging.info(f"[i] Loading llama.cpp model from {model_path} (ctx={ctx_size}, gpu_layers={gpu_layers})")
         self.llm = Llama(model_path=model_path, n_ctx=ctx_size, n_gpu_layers=gpu_layers, seed=seed or -1)
 
@@ -386,6 +559,8 @@ class OpenAICompatBackend(BackendBase):
         if not _HAS_REQUESTS:
             logging.error("[x] requests not available. Install it or choose the llamacpp backend.")
             raise RuntimeError("requests missing.")
+        if _ZERO_NETWORK_GUARD_ENABLED:
+            raise _zero_network_error()
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model_name
@@ -394,6 +569,8 @@ class OpenAICompatBackend(BackendBase):
     def generate(self, system_prompt: str, user_prompt: str, stop: List[str],
                  temperature: float, top_p: float, max_tokens: int,
                  repeat_penalty: float) -> str:
+        if _ZERO_NETWORK_GUARD_ENABLED:
+            raise _zero_network_error()
         # Note: many local servers ignore repeat_penalty; still included for parity.
         payload = {
             "model": self.model,
@@ -1567,7 +1744,7 @@ class DuelEngine:
 # ---------------------------
 # CLI
 # ---------------------------
-def parse_args() -> argparse.Namespace:
+def parse_run_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Simulate an endless philosophical dialogue between two personas, locally.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -1633,14 +1810,109 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Misc
+    p.add_argument(
+        "--zero-network",
+        choices=["on", "off"],
+        default="on",
+        help="Block outbound HTTP requests (set to 'off' to permit HTTP backends).",
+    )
     p.add_argument("-v", "--verbose", action="count", default=1, help="Increase logging verbosity (-v, -vv).")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
-    setup_logging(args.verbose)
+def parse_nuke_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="dom nuke",
+        description="Delete run-specific transcripts and memory artifacts from the SQLite database.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("db_path", help="Path to the SQLite database to purge.")
+    p.add_argument(
+        "--run-id",
+        type=int,
+        default=None,
+        help="Limit deletion to a specific run id (omit to clear all runs).",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Skip the confirmation guard and execute immediately.",
+    )
+    p.add_argument("-v", "--verbose", action="count", default=1, help="Increase logging verbosity (-v, -vv).")
+    return p.parse_args(argv)
+
+
+def parse_cli(argv: Optional[Sequence[str]] = None) -> Tuple[str, argparse.Namespace]:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    if tokens and tokens[0].lower() == "nuke":
+        return "nuke", parse_nuke_args(tokens[1:])
+    if tokens and tokens[0].lower() == "run":
+        tokens = tokens[1:]
+    return "run", parse_run_args(tokens)
+
+
+def handle_nuke(args: argparse.Namespace) -> None:
+    if not args.force:
+        logging.error("[x] Refusing to execute 'dom nuke' without --force confirmation.")
+        sys.exit(2)
+
+    db_path = os.path.abspath(args.db_path)
+    if not os.path.exists(db_path):
+        logging.error(f"[x] Database not found: {db_path}")
+        sys.exit(2)
+
+    try:
+        conn = init_db(db_path)
+    except Exception as e:
+        logging.error(f"[x] Failed to open DB: {e}")
+        sys.exit(2)
+
+    tables = (
+        ("messages", "run_id"),
+        ("facts", "run_id"),
+        ("themes", "run_id"),
+        ("summaries", "run_id"),
+        ("message_embeddings", "run_id"),
+        ("growth_metrics", "run_id"),
+    )
+
+    scope = "all runs" if args.run_id is None else f"run {args.run_id}"
+    deletions: Dict[str, int] = {}
+
+    try:
+        with conn:
+            for table, column in tables:
+                if args.run_id is None:
+                    cur = conn.execute(f"DELETE FROM {table}")
+                else:
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE {column}=?",
+                        (args.run_id,),
+                    )
+                deleted = cur.rowcount if cur.rowcount is not None else 0
+                if deleted < 0:
+                    deleted = 0
+                deletions[table] = deleted
+        conn.execute("REINDEX;")
+        conn.execute("PRAGMA optimize;")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+    finally:
+        conn.close()
+
+    total_deleted = sum(deletions.values())
+    logging.info(f"[i] Removed {total_deleted} row(s) across {len(deletions)} tables for {scope}.")
+    for table, count in deletions.items():
+        logging.debug(f"[DEBUG] {table}: deleted {count} row(s).")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    command, args = parse_cli(argv)
+    setup_logging(getattr(args, "verbose", 1))
+
+    if command == "nuke":
+        handle_nuke(args)
+        return
 
     try:
         max_wallclock_seconds = parse_wallclock_arg(args.max_wallclock)
@@ -1664,6 +1936,10 @@ def main() -> None:
         logging.error("[x] --recall-alpha must be between 0.0 and 1.0.")
         sys.exit(2)
 
+    zero_network_enabled = args.zero_network == "on"
+    if zero_network_enabled:
+        enable_zero_network_guard()
+
     growth_checks_enabled = args.growth_checks == "on"
 
     # Basic validations
@@ -1675,6 +1951,11 @@ def main() -> None:
         sys.exit(2)
     if args.backend == "openai" and not _HAS_REQUESTS:
         logging.error("[x] requests not installed. pip install requests")
+        sys.exit(2)
+    if zero_network_enabled and args.backend != "llamacpp":
+        logging.error(
+            "[x] Zero-network mode blocks HTTP backends. Use --zero-network off to run the OpenAI-compatible backend."
+        )
         sys.exit(2)
 
     # Load personas
@@ -1733,15 +2014,23 @@ def main() -> None:
         if gpu_layers_value < 0:
             logging.error("[x] --gpu-layers must be >= 0.")
             sys.exit(2)
-        backend = LlamaCppBackend(
-            model_path=args.model_path,
-            ctx_size=args.ctx_size,
-            gpu_layers=gpu_layers_value,
-            seed=args.seed if args.seed >= 0 else None
-        )
+        try:
+            backend = LlamaCppBackend(
+                model_path=args.model_path,
+                ctx_size=args.ctx_size,
+                gpu_layers=gpu_layers_value,
+                seed=args.seed if args.seed >= 0 else None
+            )
+        except Exception as e:
+            logging.error(f"[x] Failed to initialize llama.cpp backend: {e}")
+            sys.exit(2)
         model_id = os.path.basename(args.model_path)
     else:
-        backend = OpenAICompatBackend(api_base=args.api_base, api_key=args.api_key, model_name=args.model_name)
+        try:
+            backend = OpenAICompatBackend(api_base=args.api_base, api_key=args.api_key, model_name=args.model_name)
+        except Exception as e:
+            logging.error(f"[x] Failed to initialize OpenAI-compatible backend: {e}")
+            sys.exit(2)
         model_id = args.model_name
         gpu_layers_mode = "n/a"
         gpu_layers_value = -1
@@ -1753,8 +2042,6 @@ def main() -> None:
         logging.error(f"[x] Failed to open DB: {e}")
         sys.exit(2)
 
-    # Resume or new run
-    import json
     params = {
         "speaker_a": args.speaker_a,
         "speaker_b": args.speaker_b,
@@ -1783,6 +2070,8 @@ def main() -> None:
         "topic_graph_path": topic_graph_path,
         "topic_pivot_interval": topic_pivot_interval,
         "topic_guidance_enabled": bool(topic_graph),
+        "zero_network": args.zero_network,
+        "zero_network_enabled": zero_network_enabled,
     }
 
     run_id: Optional[int] = None
