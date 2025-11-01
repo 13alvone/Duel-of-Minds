@@ -7,8 +7,12 @@ import signal
 import sqlite3
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Any, Deque, Dict, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from topics import Theme, TopicGraph
 
 # Optional: llama.cpp backend
 try:
@@ -23,6 +27,11 @@ try:
     _HAS_REQUESTS = True
 except Exception:
     _HAS_REQUESTS = False
+
+
+DEFAULT_TOPIC_GRAPH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "data", "topics", "existential_pivots.yaml")
+)
 
 
 # ---------------------------
@@ -209,7 +218,12 @@ def read_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-def build_system_prompt(persona_text: str, long_summary: str, safety_notes: str) -> str:
+def build_system_prompt(
+    persona_text: str,
+    long_summary: str,
+    safety_notes: str,
+    topic_guidance: Optional[str] = None,
+) -> str:
     # Keep this brief and directive; don’t embed copyrighted corpora here.
     lines = [
         "You are to speak in a consistent philosophical persona.",
@@ -228,9 +242,20 @@ def build_system_prompt(persona_text: str, long_summary: str, safety_notes: str)
         "Safety notes:",
         safety_notes.strip() if safety_notes else "Do not disclose sensitive or private information.",
     ]
+    if topic_guidance:
+        lines.extend([
+            "",
+            "Topic focus:",
+            topic_guidance.strip(),
+        ])
     return "\n".join(lines)
 
-def make_turn_prompt(history: List[Tuple[str, str]], next_speaker: str, stopwords: List[str]) -> str:
+def make_turn_prompt(
+    history: List[Tuple[str, str]],
+    next_speaker: str,
+    stopwords: List[str],
+    topic_guidance: Optional[str] = None,
+) -> str:
     # Render short buffer
     rendered = []
     for speaker, content in history:
@@ -240,6 +265,8 @@ def make_turn_prompt(history: List[Tuple[str, str]], next_speaker: str, stopword
     # Ensure stopwords don’t accidentally appear mid-turn by hinting format
     if stopwords:
         prompt += "\n\n(Respond as the next line. Avoid the explicit tokens: " + ", ".join(stopwords) + ")"
+    if topic_guidance:
+        prompt += "\n\n[Topic focus]\n" + topic_guidance.strip()
     return prompt
 
 def ngram_block(text: str, prior_texts: List[str], n: int) -> str:
@@ -335,7 +362,9 @@ class DuelEngine:
                  max_wallclock_seconds: Optional[float],
                  pause_jitter: Tuple[float, float],
                  growth_checks: bool,
-                 novelty_threshold: float):
+                 novelty_threshold: float,
+                 topic_graph: Optional["TopicGraph"] = None,
+                 topic_pivot_interval: int = 0):
         self.backend = backend
         self.db = db
         self.run_id = run_id
@@ -359,6 +388,21 @@ class DuelEngine:
         self.pause_jitter = pause_jitter
         self.growth_checks = growth_checks
         self.novelty_threshold = novelty_threshold
+        self.topic_graph = topic_graph
+        self.topic_pivot_interval = (
+            topic_pivot_interval if topic_graph and topic_pivot_interval > 0 else None
+        )
+        self._turns_since_pivot = 0
+        self._current_theme_id: Optional[str] = None
+        self._recent_theme_ids: Deque[str] = deque(maxlen=5)
+        self._rng = random.Random()
+        if self.topic_graph:
+            initial_theme = self.topic_graph.pick_initial_theme(self._rng)
+            self._current_theme_id = initial_theme.key
+            self._recent_theme_ids.append(initial_theme.key)
+            logging.info(
+                f"[i] Topic focus initialized: {initial_theme.title}"
+            )
         self._start_monotonic: Optional[float] = None
         self._max_regen_attempts = 2
 
@@ -382,10 +426,66 @@ class DuelEngine:
         except Exception as e:
             logging.warning(f"[!] Summary generation failed: {e}")
 
-    def _system_for(self, speaker: str) -> str:
+    def _active_theme(self) -> Optional["Theme"]:
+        if not self.topic_graph or not self._current_theme_id:
+            return None
+        try:
+            return self.topic_graph.theme(self._current_theme_id)
+        except KeyError:
+            return None
+
+    def _topic_guidance_text(self) -> Optional[str]:
+        theme = self._active_theme()
+        if not theme:
+            return None
+        lines = [f"{theme.title}: {theme.summary}"]
+        for cue in theme.guidance:
+            lines.append(f"- {cue}")
+        if self.topic_graph:
+            previews = []
+            for transition in self.topic_graph.preview_transitions(theme.key):
+                if transition.target == theme.key:
+                    continue
+                try:
+                    target_theme = self.topic_graph.theme(transition.target)
+                except KeyError:
+                    continue
+                label = f"Pivot to {target_theme.title}"
+                if transition.cue:
+                    label += f": {transition.cue}"
+                previews.append(f"- {label}")
+            if previews:
+                lines.append("Upcoming pivots:")
+                lines.extend(previews)
+        return "\n".join(lines)
+
+    def _maybe_pivot_topic(self) -> None:
+        if not self.topic_graph or self.topic_pivot_interval is None:
+            return
+        if self._turns_since_pivot < self.topic_pivot_interval:
+            return
+        next_theme = self.topic_graph.next_theme(
+            self._current_theme_id,
+            self._rng,
+            tuple(self._recent_theme_ids),
+        )
+        if not next_theme:
+            self._turns_since_pivot = 0
+            return
+        current = self._active_theme()
+        if not current or current.key != next_theme.key:
+            prior_title = current.title if current else "(none)"
+            logging.info(
+                f"[i] Pivoting topic from {prior_title} to {next_theme.title}."
+            )
+            self._current_theme_id = next_theme.key
+            self._recent_theme_ids.append(next_theme.key)
+        self._turns_since_pivot = 0
+
+    def _system_for(self, speaker: str, topic_guidance: Optional[str]) -> str:
         persona = self.persona_a if speaker == self.speaker_a else self.persona_b
         safety = "Avoid long verbatim quotations. Prefer original synthesis. Do not invent private facts."
-        return build_system_prompt(persona, self.long_summary, safety)
+        return build_system_prompt(persona, self.long_summary, safety, topic_guidance)
 
     def _recent_texts(self) -> List[str]:
         ctx = fetch_recent_context(self.db, self.run_id, k=10)
@@ -406,8 +506,9 @@ class DuelEngine:
 
     def _generate_turn(self, next_speaker: str) -> str:
         history = fetch_recent_context(self.db, self.run_id, k=self.short_ctx_turns)
-        system_prompt = self._system_for(next_speaker)
-        user_prompt = make_turn_prompt(history, next_speaker, self.stopwords)
+        topic_guidance = self._topic_guidance_text()
+        system_prompt = self._system_for(next_speaker, topic_guidance)
+        user_prompt = make_turn_prompt(history, next_speaker, self.stopwords, topic_guidance)
         logging.debug(f"[DEBUG] System prompt for {next_speaker} is {len(system_prompt)} chars.")
         logging.debug(f"[DEBUG] User prompt length={len(user_prompt)} chars.")
         raw = self.backend.generate(
@@ -439,6 +540,7 @@ class DuelEngine:
                 if elapsed >= self.max_wallclock_seconds:
                     logging.info("[i] Reached max wall-clock duration; stopping run.")
                     break
+            self._maybe_pivot_topic()
             next_speaker = self.speaker_a if current_turn % 2 == 0 else self.speaker_b
             try:
                 attempts = 0
@@ -468,6 +570,8 @@ class DuelEngine:
                 logging.error(f"[x] Generation failed on turn {current_turn}: {e}")
                 # Insert an explicit defect marker and continue
                 insert_message(self.db, self.run_id, current_turn, next_speaker, f"(generation_error: {e})")
+            finally:
+                self._turns_since_pivot += 1
 
             # Periodic summarization to keep a rolling long-term memory
             if self.summary_every > 0 and current_turn % self.summary_every == 0:
@@ -531,6 +635,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pause-jitter", default="700,4000", help="Pause between turns in milliseconds as 'min,max'.")
     p.add_argument("--growth-checks", choices=["on", "off"], default="on", help="Enforce simple novelty checks each turn.")
     p.add_argument("--novelty-threshold", type=float, default=0.35, help="Minimum novelty ratio required when growth checks are on.")
+    p.add_argument(
+        "--topic-graph",
+        default=DEFAULT_TOPIC_GRAPH,
+        help="Path to topic graph YAML for guided pivots (use 'off' to disable).",
+    )
+    p.add_argument(
+        "--topic-pivot-interval",
+        type=int,
+        default=6,
+        help="Number of turns to sustain a theme before pivoting to the next guided topic.",
+    )
 
     # Misc
     p.add_argument("-v", "--verbose", action="count", default=1, help="Increase logging verbosity (-v, -vv).")
@@ -578,6 +693,32 @@ def main() -> None:
     except Exception as e:
         logging.error(f"[x] Failed to read persona files: {e}")
         sys.exit(2)
+
+    topic_graph_path = (args.topic_graph or "").strip()
+    topic_graph: Optional["TopicGraph"] = None
+    topic_pivot_interval = args.topic_pivot_interval
+    if topic_graph_path.lower() in {"", "off", "none"}:
+        topic_graph_path = ""
+        topic_pivot_interval = 0
+    else:
+        if not os.path.isabs(topic_graph_path):
+            topic_graph_path = os.path.abspath(topic_graph_path)
+        from topics import load_topic_graph
+
+        try:
+            topic_graph = load_topic_graph(topic_graph_path)
+        except ModuleNotFoundError:
+            logging.error("[x] Loading topic graphs requires PyYAML. pip install pyyaml")
+            sys.exit(2)
+        except (FileNotFoundError, ValueError) as e:
+            logging.error(f"[x] Failed to load topic graph: {e}")
+            sys.exit(2)
+        if topic_pivot_interval <= 0:
+            logging.error("[x] --topic-pivot-interval must be > 0 when --topic-graph is set.")
+            sys.exit(2)
+        logging.info(
+            f"[i] Loaded topic graph '{topic_graph.name}' with {len(topic_graph.themes)} themes."
+        )
 
     # Backend init
     if args.backend == "llamacpp":
@@ -645,6 +786,9 @@ def main() -> None:
         "novelty_threshold": args.novelty_threshold,
         "gpu_layers_mode": gpu_layers_mode,
         "gpu_layers": gpu_layers_value,
+        "topic_graph_path": topic_graph_path,
+        "topic_pivot_interval": topic_pivot_interval,
+        "topic_guidance_enabled": bool(topic_graph),
     }
 
     run_id: Optional[int] = None
@@ -704,6 +848,8 @@ def main() -> None:
         pause_jitter=pause_jitter,
         growth_checks=growth_checks_enabled,
         novelty_threshold=args.novelty_threshold,
+        topic_graph=topic_graph,
+        topic_pivot_interval=topic_pivot_interval,
     )
 
     try:

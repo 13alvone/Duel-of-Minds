@@ -1,0 +1,36 @@
+name: Continental Crossroads
+entry: freedom_responsibility
+themes:
+  - id: freedom_responsibility
+    title: Freedom Entails Responsibility
+    summary: Explore how claims of human freedom create obligations to self, others, and shared worlds.
+    guidance:
+      - Connect existential and pragmatic perspectives on how choices become binding.
+      - Surface tensions between liberation and duty without falling into fatalism.
+    transitions:
+      - to: crisis_and_meaning
+        cue: Trace how moments of upheaval pressure-test commitments.
+        kind: stress-test
+  - id: crisis_and_meaning
+    title: Meaning Under Pressure
+    summary: Examine how communities rediscover meaning when stability fractures.
+    guidance:
+      - Highlight concrete practices that keep dialogue humane amid uncertainty.
+      - Contrast resilient myth-making with honest acknowledgment of limits.
+    transitions:
+      - to: solidarity_and_limits
+        cue: Follow how shared limits can become solidaristic rather than punitive.
+        kind: synthesis
+      - to: freedom_responsibility
+        cue: Loop back by questioning whether renewed meaning amplifies responsibility.
+        kind: reflection
+  - id: solidarity_and_limits
+    title: Solidarity at the Edge of Limits
+    summary: Investigate how bonds of solidarity emerge without erasing individual integrity.
+    guidance:
+      - Map models of community care that respect dissent and vulnerability.
+      - Invite pragmatic experiments that keep theory accountable to lived stakes.
+    transitions:
+      - to: freedom_responsibility
+        cue: Pivot toward how solidarity reshapes personal freedom.
+        kind: application
