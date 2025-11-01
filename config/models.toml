@@ -1,17 +1,18 @@
-# Model registry for Duel of Minds.
+# Duel of Minds model registry
 #
-# Each entry declares a trusted model file along with its expected SHA256 checksum.
-# Update this file to reflect the models installed on your machine before launching
-# the llama.cpp backend. Paths may be absolute or use ~ expansion.
+# Declare each GGUF file you trust locally so the llama.cpp backend can validate it
+# before loading. Store weights OUTSIDE the repo (e.g. D:/ai/models/...) and add one
+# [[models]] block per file with an alias, absolute path, and SHA256 checksum.
 #
-# Example:
-# [[models]]
-# alias = "deepseek-q5"
-# path = "D:/ai/models/deepseek/deepseek-q5.gguf"
-# sha256 = "0123456789abcdef..."
-#
-# Remove or replace the sample entry below with real model metadata.
+# Use ./scripts/New-ModelEntry.ps1 to compute and append entries automatically.
+# The defaults below are illustrative; replace them with your actual models.
+
 [[models]]
-alias = "sample-model"
-path = "/absolute/path/to/your/model.gguf"
-sha256 = "replace-with-real-sha256"
+alias = "example-deepseek-q5"
+path = "D:/ai/models/deepseek/deepseek-q5.gguf"
+sha256 = "replace-with-real-sha"
+
+[[models]]
+alias = "example-llama3-q4"
+path = "D:/ai/models/meta/llama3/llama3-instruct-q4.gguf"
+sha256 = "replace-with-real-sha"

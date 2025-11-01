@@ -211,3 +211,9 @@ models/
 *.gguf
 *.bin
 *.safetensors
+
+# llama.cpp binaries fetched on Windows
+bin/*.exe
+bin/*.dll
+bin/*.pdb
+bin/*.zip

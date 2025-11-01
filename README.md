@@ -1,126 +1,89 @@
-# Duel of Minds — Local Two-Persona Dialogue Runner
+# Duel of Minds (Windows 11 Vulkan Edition)
 
-Simulate an endless (or bounded) conversation between two philosophical personas (e.g., “Camus-like” and Nietzsche), entirely **offline** and **local**. Uses either `llama.cpp` via `llama-cpp-python` or any **OpenAI-compatible** local HTTP server. All turns are stored in **SQLite** with resumable runs, rolling summaries, and basic anti-loop controls.
-
----
-
-## Features
-- Local-only: `llama.cpp` or OpenAI-compatible local HTTP API.
-- Robust CLI via `argparse`; resumable runs; safe interrupts.
-- Transcript persistence in SQLite (`runs`, `messages` tables).
-- Short-term context + rolling long-term summary.
-- N-gram de-looping, repetition penalty, stop sequences.
-- External persona files; kill-switch; logging.
+Local-only dual persona dialogue engine optimized for Windows 11 + AMD Radeon platforms. Runs entirely offline using `llama.cpp` Vulkan builds or a bundled CLI fallback, with SQLite persistence and extensible personas.
 
 ---
 
-## Requirements
-- Python 3.9+
-- One of:
-	- `llama-cpp-python` and a `.gguf` model, **or**
-	- A local OpenAI-compatible server (e.g., Ollama w/ OpenAI port, LM Studio, text-gen-webui API).
-- Optional: `requests` (for OpenAI-compatible backend).
+## TL;DR Quickstart (Windows 11)
+1. **Clone** the repo somewhere separate from your model storage (e.g., `D:\workspace\Duel-of-Minds`).
+2. **Install Vulkan binaries**:
+   ```powershell
+   Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+   ./scripts/Install-LlamaCppVulkan.ps1 -VersionTag b3532
+   ```
+   This populates `./bin` with `llama.cpp.exe` + DLLs and scaffolds `config/models.toml`.
+3. **Register your models** (stored outside the repo, e.g., `D:\ai\models`):
+   ```powershell
+   ./scripts/New-ModelEntry.ps1 -Alias deepseek-q5 -ModelPath "D:/ai/models/deepseek/deepseek-q5.gguf"
+   ```
+4. **(Optional) Create a venv** and install the extras you need:
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   python -m pip install -r runtime\requirements-base.txt  # edit as desired
+   ```
+5. **Run a smoke test**:
+   ```powershell
+   python .\duel_of_minds.py data\conversations.db data\personas\camus.txt data\personas\nietzsche.txt `
+       --backend llamacpp `
+       --model-path "D:/ai/models/deepseek/deepseek-q5.gguf" `
+       --max-turns 2 `
+       --max-tokens 128 `
+       --gpu-layers auto `
+       --zero-network on `
+       -v
+   ```
+   If `llama-cpp-python` is installed, it will be used. Otherwise the runner spawns `./bin/llama.cpp.exe` directly via Vulkan.
+
+Full walkthroughs live in [`docs/windows-quickstart.md`](docs/windows-quickstart.md).
 
 ---
 
-## Install
-	python3 -m venv .venv && source .venv/bin/activate
-	pip install --upgrade pip
-	# Choose one:
-	pip install llama-cpp-python
-	# or, for OpenAI-compatible:
-	pip install requests
+## Model Placement & SHA256 Verification
+- Keep GGUF weights on a separate drive (`D:\ai\models`).
+- Declare each file in `config/models.toml` with alias, absolute path, and SHA256 hash.
+- Use [`scripts/New-ModelEntry.ps1`](scripts/New-ModelEntry.ps1) to compute and append verified entries.
+- Manual checksum recipes (PowerShell + Python) and storage layout tips are documented in [`docs/model-prep.md`](docs/model-prep.md).
+
+The runner refuses to load any model not listed in the config file, preventing accidental use of tampered weights.
 
 ---
 
-## Persona Files
-Prepare two small text files describing each persona’s voice and guardrails (do NOT paste long copyrighted passages).
-
-	# persona_camus.txt (example snippet)
-	Voice: lucid, humane, measured; explores absurdity and revolt without nihilism; favors clarity and concrete images; resists grand systems.
-
-	# persona_nietzsche.txt (example snippet)
-	Voice: incisive, aphoristic; genealogy of morals; self-overcoming; paradox that clarifies; metaphor as hammer; distrust herd morality.
+## AMD Vulkan Tuning Highlights
+- Start with `--gpu-layers auto` to probe the Radeon iGPU/dGPU.
+- Recommended quantizations: Q5_K_M for premium quality, Q4_K_M for extended runs.
+- Use `--pause-jitter "700,4000"` and serialize turns to avoid iGPU contention.
+- Additional tables, troubleshooting tips, and recovery steps are available in [`docs/amd-vulkan-tuning.md`](docs/amd-vulkan-tuning.md).
 
 ---
 
-## Quick Start (llama.cpp backend)
-	./duel_of_minds.py conversations.db persona_camus.txt persona_nietzsche.txt \
-		--backend llamacpp \
-		--model-path /path/to/model.gguf \
-		--speaker-a Camus --speaker-b Nietzsche \
-		--max-turns 200 --short-ctx-turns 18 \
-		--temperature 0.8 --top-p 0.95 --repeat-penalty 1.1 \
-		--max-tokens 512 --max-reply-chars 1400 \
-		--ngram-block 4 --stop Camus: Nietzsche: \
-		--summary-every 50 --summary-chars 1200 -vv
+## CLI Essentials
+Run `python .\duel_of_minds.py --help` for the full argument list. Key switches:
 
-**Notes**
-- Press **Ctrl-C** anytime; the current turn finishes and the run stops cleanly.
-- Re-run with `--resume` to continue the latest matching run.
+| Category | Flags |
+|----------|-------|
+| Backend  | `--backend {llamacpp|openai}`, `--model-path`, `--gpu-layers`, `--api-base`, `--model-name` |
+| Dialogue | `--speaker-a`, `--speaker-b`, `--max-turns`, `--resume`, `--pause-jitter`, `--max-tokens` |
+| Safety   | `--zero-network {on|off}`, `--stop`, `--ngram-block`, `--repeat-penalty` |
+| Memory   | `--summary-every`, `--summary-chars`, `--ctx-size` |
+| Logging  | `-v`, `-vv`, `--log-file` |
+
+Personas live under `data/personas/`; topic graphs and seeds are in `data/topics/`.
 
 ---
 
-## Quick Start (OpenAI-compatible backend)
-Run your local server, then:
-
-	./duel_of_minds.py conversations.db persona_camus.txt persona_nietzsche.txt \
-		--backend openai \
-		--api-base http://127.0.0.1:11434/v1 \
-		--api-key sk-local \
-		--model-name my-local-model \
-		--max-turns 200 --resume -v
+## Offline & Security Guarantees
+- Default zero-network guard blocks outbound HTTP; disable with `--zero-network off` only when targeting trusted local APIs.
+- SQLite transcripts live in `data/` by default; rotate via the positional `db_path` argument.
+- Use `scripts/Install-LlamaCppVulkan.ps1 -Force` to refresh binaries whenever AMD driver updates land.
 
 ---
 
-## Resuming & Inspecting
-- **Resume:** add `--resume` to continue the last run with the same backend/model/personas.
-- **Inspect transcripts:** open `conversations.db`:
+## Need More?
+- [Windows 11 Quickstart](docs/windows-quickstart.md)
+- [Model Placement & Integrity](docs/model-prep.md)
+- [AMD Vulkan Tuning Cheatsheet](docs/amd-vulkan-tuning.md)
+- [AGENTS.md](AGENTS.md) for the long-term roadmap and design constraints.
 
-	sqlite3 conversations.db
-	.headers on
-	.mode column
-	SELECT id, started_at_utc, backend, model_name FROM runs ORDER BY id DESC LIMIT 5;
-	SELECT turn_index, speaker, substr(content,1,120) AS snippet FROM messages WHERE run_id=<ID> ORDER BY turn_index;
-
----
-
-## Key CLI Options (essentials)
-- Backends:
-	- `--backend {llamacpp|openai}`
-	- Llama.cpp: `--model-path`, `--ctx-size`, `--gpu-layers`, `--seed`
-	- OpenAI-compat: `--api-base`, `--api-key`, `--model-name`
-- Dialogue:
-	- `--speaker-a`, `--speaker-b`, `--max-turns`, `--resume`
-	- Context & style: `--short-ctx-turns`, `--temperature`, `--top-p`, `--repeat-penalty`, `--max-tokens`, `--max-reply-chars`
-	- De-loop & stops: `--ngram-block`, `--stop ...`
-	- Summarization: `--summary-every`, `--summary-chars`
-- Logging: `-v` (info), `-vv` (debug)
-
----
-
-## Good Practices
-- **Ethics & legality:** Nietzsche’s corpus is public domain; for living or copyright-protected authors, model *style* without copying long texts. Prefer paraphrase and public-domain sources.
-- **Persona design:** Keep files concise and directive (tone, objectives, taboos). Avoid “quote dumps”.
-- **Stability:** If looping or blandness appears, tune `--temperature`, `--top-p`, `--repeat-penalty`, and `--ngram-block`. Increase `--short-ctx-turns` sparingly to fit context.
-- **Safety rails:** Use `--stop` tokens (`Camus:`, `Nietzsche:`) and keep persona files from inviting biographical fantasies or private claims.
-
----
-
-## Troubleshooting
-- **Empty or repetitive replies:** raise `--temperature` slightly, tune `--repeat-penalty` (e.g., 1.1→1.2), set `--ngram-block 4–6`.
-- **Context truncation:** increase `--ctx-size` (llama.cpp) and/or lower `--short-ctx-turns` / `--max-reply-chars`.
-- **HTTP errors (openai backend):** verify `--api-base` URL, `--model-name`, and server is running; check logs for 401/404/500.
-- **Slow startup (llama.cpp):** first load compiles kernels/maps; subsequent runs are faster. Adjust `--gpu-layers`.
-
----
-
-## Why SQLite?
-- Durable transcripts, resumable runs, easy querying, compact storage, and zero external dependencies.
-
----
-
-## License & Attribution
-This component orchestrates local generation and stores transcripts. Ensure your **model** and **persona sources** comply with their licenses. You own your transcripts; handle them responsibly.
-
----
+Contributions should preserve the local-only, Windows-first philosophy and avoid bundling proprietary weights. Stay philosophical, stay offline.
