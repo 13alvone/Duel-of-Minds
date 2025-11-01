@@ -2,6 +2,7 @@
 import argparse
 import logging
 import os
+import random
 import signal
 import sqlite3
 import sys
@@ -270,6 +271,45 @@ def safe_int(val: str, default: int) -> int:
         return default
 
 
+def parse_wallclock_arg(value: str) -> Optional[float]:
+    """Convert wall-clock duration strings like '24h', '30m', '90s', 'off' into seconds."""
+    if value is None:
+        raise ValueError("Wall-clock value is required.")
+    token = value.strip().lower()
+    if token in {"off", "none", "0"}:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if token[-1] in units:
+        magnitude = token[:-1]
+        unit = token[-1]
+    else:
+        magnitude = token
+        unit = "s"
+    if not magnitude.isdigit():
+        raise ValueError(f"Invalid wall-clock duration: {value}")
+    seconds = int(magnitude) * units[unit]
+    if seconds <= 0:
+        raise ValueError("Wall-clock duration must be positive or 'off'.")
+    return float(seconds)
+
+
+def parse_pause_jitter_arg(value: str) -> Tuple[float, float]:
+    """Parse pause jitter bounds expressed as 'min_ms,max_ms' into seconds."""
+    if value is None:
+        raise ValueError("Pause jitter value is required.")
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError("Pause jitter must be two comma-separated millisecond values.")
+    try:
+        min_ms = float(parts[0])
+        max_ms = float(parts[1])
+    except ValueError as exc:
+        raise ValueError("Pause jitter values must be numeric.") from exc
+    if min_ms < 0 or max_ms < 0 or max_ms < min_ms:
+        raise ValueError("Pause jitter must be non-negative and max >= min.")
+    return (min_ms / 1000.0, max_ms / 1000.0)
+
+
 # ---------------------------
 # Main conversational engine
 # ---------------------------
@@ -291,7 +331,11 @@ class DuelEngine:
                  repeat_penalty: float,
                  ngram_block_n: int,
                  summary_every: int,
-                 summary_chars: int):
+                 summary_chars: int,
+                 max_wallclock_seconds: Optional[float],
+                 pause_jitter: Tuple[float, float],
+                 growth_checks: bool,
+                 novelty_threshold: float):
         self.backend = backend
         self.db = db
         self.run_id = run_id
@@ -311,6 +355,12 @@ class DuelEngine:
         self.summary_chars = summary_chars
         self.long_summary = ""  # rolling summary we refresh periodically
         self._shutdown = False
+        self.max_wallclock_seconds = max_wallclock_seconds
+        self.pause_jitter = pause_jitter
+        self.growth_checks = growth_checks
+        self.novelty_threshold = novelty_threshold
+        self._start_monotonic: Optional[float] = None
+        self._max_regen_attempts = 2
 
     def signal_handler(self, *_: Any) -> None:
         logging.warning("[!] Caught signal; finishing current turn and stopping.")
@@ -341,6 +391,19 @@ class DuelEngine:
         ctx = fetch_recent_context(self.db, self.run_id, k=10)
         return [c for _, c in ctx]
 
+    def _novelty_score(self, text: str) -> float:
+        if not text.strip():
+            return 0.0
+        prior = " ".join(self._recent_texts()).lower()
+        if not prior.strip():
+            return 1.0
+        prior_words = set(prior.split())
+        words = [w for w in text.lower().split() if w]
+        if not words:
+            return 0.0
+        novel = [w for w in words if w not in prior_words]
+        return len(novel) / len(words)
+
     def _generate_turn(self, next_speaker: str) -> str:
         history = fetch_recent_context(self.db, self.run_id, k=self.short_ctx_turns)
         system_prompt = self._system_for(next_speaker)
@@ -369,15 +432,38 @@ class DuelEngine:
             logging.info(f"[i] Seeded opening by {self.speaker_a}.")
             current_turn = 1
 
+        self._start_monotonic = time.monotonic()
         while current_turn <= max_turns and not self._shutdown:
+            if self.max_wallclock_seconds is not None and self._start_monotonic is not None:
+                elapsed = time.monotonic() - self._start_monotonic
+                if elapsed >= self.max_wallclock_seconds:
+                    logging.info("[i] Reached max wall-clock duration; stopping run.")
+                    break
             next_speaker = self.speaker_a if current_turn % 2 == 0 else self.speaker_b
             try:
-                reply = self._generate_turn(next_speaker)
+                attempts = 0
+                reply = ""
+                novelty = 0.0
+                while attempts <= self._max_regen_attempts:
+                    reply = self._generate_turn(next_speaker)
+                    novelty = self._novelty_score(reply)
+                    if not self.growth_checks or novelty >= self.novelty_threshold:
+                        break
+                    attempts += 1
+                    logging.warning(
+                        f"[!] Novelty score {novelty:.3f} below threshold {self.novelty_threshold:.3f}; regenerating (attempt {attempts})."
+                    )
+                if self.growth_checks and novelty < self.novelty_threshold:
+                    logging.warning(
+                        f"[!] Proceeding with reply below novelty threshold ({novelty:.3f} < {self.novelty_threshold:.3f})."
+                    )
                 if not reply:
                     logging.warning("[!] Empty reply received; inserting '(…)' and continuing.")
                     reply = "(…)"
                 insert_message(self.db, self.run_id, current_turn, next_speaker, reply)
                 logging.info(f"[i] Turn {current_turn} by {next_speaker} stored ({len(reply)} chars).")
+                if self.growth_checks:
+                    logging.debug(f"[DEBUG] Novelty score for turn {current_turn}: {novelty:.3f}")
             except Exception as e:
                 logging.error(f"[x] Generation failed on turn {current_turn}: {e}")
                 # Insert an explicit defect marker and continue
@@ -386,6 +472,12 @@ class DuelEngine:
             # Periodic summarization to keep a rolling long-term memory
             if self.summary_every > 0 and current_turn % self.summary_every == 0:
                 self.summarize_long_context()
+
+            if self.pause_jitter[1] > 0:
+                wait = random.uniform(self.pause_jitter[0], self.pause_jitter[1])
+                if wait > 0:
+                    logging.debug(f"[DEBUG] Sleeping for {wait:.2f}s between turns to simulate pacing.")
+                    time.sleep(wait)
 
             current_turn += 1
 
@@ -409,7 +501,11 @@ def parse_args() -> argparse.Namespace:
     # llama.cpp
     p.add_argument("--model-path", default="", help="Path to .gguf model (llamacpp backend).")
     p.add_argument("--ctx-size", type=int, default=4096, help="Context size (llamacpp).")
-    p.add_argument("--gpu-layers", type=int, default=35, help="GPU offload layers (llamacpp).")
+    p.add_argument(
+        "--gpu-layers",
+        default="auto",
+        help="GPU offload layers (llamacpp). Use 'auto' to probe hardware and choose for you."
+    )
     p.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (llamacpp).")
     # OpenAI-compatible
     p.add_argument("--api-base", default="http://127.0.0.1:11434/v1", help="OpenAI-compatible base URL.")
@@ -431,6 +527,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--summary-every", type=int, default=50, help="Refresh rolling summary every N turns (0 to disable).")
     p.add_argument("--summary-chars", type=int, default=1200, help="Max chars to keep in rolling summary.")
     p.add_argument("--resume", action="store_true", help="Resume last run in the DB (same backend/model/personas).")
+    p.add_argument("--max-wallclock", default="24h", help="Maximum wall-clock duration before stopping (e.g. 30m, 2h, off).")
+    p.add_argument("--pause-jitter", default="700,4000", help="Pause between turns in milliseconds as 'min,max'.")
+    p.add_argument("--growth-checks", choices=["on", "off"], default="on", help="Enforce simple novelty checks each turn.")
+    p.add_argument("--novelty-threshold", type=float, default=0.35, help="Minimum novelty ratio required when growth checks are on.")
 
     # Misc
     p.add_argument("-v", "--verbose", action="count", default=1, help="Increase logging verbosity (-v, -vv).")
@@ -441,6 +541,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
+
+    try:
+        max_wallclock_seconds = parse_wallclock_arg(args.max_wallclock)
+    except ValueError as e:
+        logging.error(f"[x] {e}")
+        sys.exit(2)
+
+    try:
+        pause_jitter = parse_pause_jitter_arg(args.pause_jitter)
+    except ValueError as e:
+        logging.error(f"[x] Invalid --pause-jitter value: {e}")
+        sys.exit(2)
+
+    if not 0.0 <= args.novelty_threshold <= 1.0:
+        logging.error("[x] --novelty-threshold must be between 0.0 and 1.0.")
+        sys.exit(2)
+
+    growth_checks_enabled = args.growth_checks == "on"
 
     # Basic validations
     if args.backend == "llamacpp" and not args.model_path:
@@ -463,16 +581,38 @@ def main() -> None:
 
     # Backend init
     if args.backend == "llamacpp":
+        gpu_layers_arg = str(args.gpu_layers).strip()
+        gpu_layers_mode = "auto" if gpu_layers_arg.lower() == "auto" else "manual"
+        if gpu_layers_mode == "auto":
+            try:
+                from runtime.gpu_probe import auto_select_gpu_layers
+
+                gpu_layers_value = auto_select_gpu_layers(ctx_size=args.ctx_size)
+                logging.info(f"[i] Auto-selected {gpu_layers_value} GPU layers via hardware probe.")
+            except Exception as e:
+                logging.warning(f"[!] GPU auto-selection failed ({e}); falling back to 35 layers.")
+                gpu_layers_value = 35
+        else:
+            try:
+                gpu_layers_value = int(gpu_layers_arg)
+            except ValueError:
+                logging.error("[x] --gpu-layers must be an integer or 'auto'.")
+                sys.exit(2)
+        if gpu_layers_value < 0:
+            logging.error("[x] --gpu-layers must be >= 0.")
+            sys.exit(2)
         backend = LlamaCppBackend(
             model_path=args.model_path,
             ctx_size=args.ctx_size,
-            gpu_layers=args.gpu_layers,
+            gpu_layers=gpu_layers_value,
             seed=args.seed if args.seed >= 0 else None
         )
         model_id = os.path.basename(args.model_path)
     else:
         backend = OpenAICompatBackend(api_base=args.api_base, api_key=args.api_key, model_name=args.model_name)
         model_id = args.model_name
+        gpu_layers_mode = "n/a"
+        gpu_layers_value = -1
 
     # DB
     try:
@@ -496,6 +636,15 @@ def main() -> None:
         "ngram_block": args.ngram_block,
         "summary_every": args.summary_every,
         "summary_chars": args.summary_chars,
+        "max_wallclock": args.max_wallclock,
+        "max_wallclock_seconds": max_wallclock_seconds,
+        "pause_jitter": args.pause_jitter,
+        "pause_jitter_seconds": list(pause_jitter),
+        "growth_checks": args.growth_checks,
+        "growth_checks_enabled": growth_checks_enabled,
+        "novelty_threshold": args.novelty_threshold,
+        "gpu_layers_mode": gpu_layers_mode,
+        "gpu_layers": gpu_layers_value,
     }
 
     run_id: Optional[int] = None
@@ -551,6 +700,10 @@ def main() -> None:
         ngram_block_n=args.ngram_block,
         summary_every=args.summary_every,
         summary_chars=args.summary_chars,
+        max_wallclock_seconds=max_wallclock_seconds,
+        pause_jitter=pause_jitter,
+        growth_checks=growth_checks_enabled,
+        novelty_threshold=args.novelty_threshold,
     )
 
     try:
