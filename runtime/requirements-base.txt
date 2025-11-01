@@ -1,0 +1,7 @@
+# Optional baseline dependencies for Duel of Minds on Windows.
+# Uncomment the lines you need or replace with pinned versions.
+# llama-cpp-python
+# numpy
+# pyyaml
+# onnxruntime
+# tokenizers

@@ -11,7 +11,9 @@ import re
 import signal
 import socket
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -79,6 +81,9 @@ except Exception:
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
 MODELS_CONFIG_PATH = os.path.join(CONFIG_DIR, "models.toml")
+BIN_DIR = os.path.join(BASE_DIR, "bin")
+
+_LLAMA_CLI_CACHE: Optional[str] = None
 
 DEFAULT_TOPIC_GRAPH = os.path.abspath(
     os.path.join(BASE_DIR, "data", "topics", "existential_pivots.yaml")
@@ -243,6 +248,40 @@ def verify_model_checksum(model_path: str) -> None:
         )
 
     logging.info(f"[i] Verified SHA256 for model {normalized_path}.")
+
+
+def locate_llama_cli_binary() -> Optional[str]:
+    """Return the path to a bundled llama.cpp executable if present."""
+
+    global _LLAMA_CLI_CACHE
+
+    if _LLAMA_CLI_CACHE and os.path.exists(_LLAMA_CLI_CACHE):
+        return _LLAMA_CLI_CACHE
+
+    if not os.path.isdir(BIN_DIR):
+        return None
+
+    preferred_names = [
+        "llama.cpp.exe",
+        "llama.cpp",
+        "main.exe",
+        "llama.exe",
+    ]
+    for name in preferred_names:
+        candidate = os.path.join(BIN_DIR, name)
+        if os.path.exists(candidate):
+            _LLAMA_CLI_CACHE = candidate
+            return candidate
+
+    for root_dir, _dirnames, filenames in os.walk(BIN_DIR):
+        for fname in filenames:
+            lower = fname.lower()
+            if lower in {"llama.cpp.exe", "llama.exe", "main.exe"}:
+                candidate = os.path.join(root_dir, fname)
+                _LLAMA_CLI_CACHE = candidate
+                return candidate
+
+    return None
 
 
 # ---------------------------
@@ -553,6 +592,102 @@ class LlamaCppBackend(BackendBase):
             embeddings.append(list(result["data"][0]["embedding"]))
         return embeddings
 
+
+class LlamaCppCliBackend(BackendBase):
+    def __init__(self, model_path: str, ctx_size: int, gpu_layers: int, seed: Optional[int]):
+        if not os.path.exists(model_path):
+            logging.error(f"[x] Model path does not exist: {model_path}")
+            raise FileNotFoundError(model_path)
+        verify_model_checksum(model_path)
+        binary_path = locate_llama_cli_binary()
+        if not binary_path:
+            raise RuntimeError(
+                "llama.cpp executable not found in ./bin. Run scripts/Install-LlamaCppVulkan.ps1 first."
+            )
+        self.binary_path = binary_path
+        self.model_path = _normalize_model_path(model_path)
+        self.ctx_size = ctx_size
+        self.gpu_layers = gpu_layers
+        self.seed = seed if seed is not None else -1
+        logging.info(f"[i] Using llama.cpp CLI backend at {self.binary_path}")
+
+    @staticmethod
+    def _compose_prompt(system_prompt: str, user_prompt: str) -> str:
+        system = system_prompt.strip()
+        user = user_prompt.strip()
+        return f"<<SYS>>\n{system}\n<</SYS>>\n\n{user}\n"
+
+    @staticmethod
+    def _strip_cli_output(raw: str, prompt: str) -> str:
+        text = raw.replace("\r\n", "\n")
+        if text.startswith(prompt):
+            text = text[len(prompt):]
+        lines = []
+        for line in text.splitlines():
+            if line.startswith("llama_print_timings") or line.startswith("sampling stats"):
+                continue
+            if line.startswith("main:"):
+                continue
+            lines.append(line)
+        cleaned = "\n".join(lines).strip()
+        return cleaned
+
+    def generate(self, system_prompt: str, user_prompt: str, stop: List[str],
+                 temperature: float, top_p: float, max_tokens: int,
+                 repeat_penalty: float) -> str:
+        prompt = self._compose_prompt(system_prompt, user_prompt)
+        predict_tokens = max_tokens if max_tokens > 0 else 512
+        with tempfile.TemporaryDirectory(prefix="dom-llama-") as tmpdir:
+            prompt_path = os.path.join(tmpdir, "prompt.txt")
+            with open(prompt_path, "w", encoding="utf-8") as handle:
+                handle.write(prompt)
+            cmd = [
+                self.binary_path,
+                "--model", self.model_path,
+                "--ctx-size", str(self.ctx_size),
+                "-n", str(predict_tokens),
+                "--temp", f"{temperature:.4f}",
+                "--top-p", f"{top_p:.4f}",
+                "--repeat-penalty", f"{repeat_penalty:.4f}",
+                "--prompt-file", prompt_path,
+                "--simple-io",
+                "--no-ansi",
+            ]
+            if self.gpu_layers > 0:
+                cmd.extend(["--gpu-layers", str(self.gpu_layers)])
+            if self.seed is not None and self.seed >= 0:
+                cmd.extend(["--seed", str(self.seed)])
+            for token in stop:
+                if token:
+                    cmd.extend(["--stop", token])
+
+            logging.debug(f"[DEBUG] Launching llama.cpp CLI: {' '.join(cmd)}")
+            try:
+                result = subprocess.run(
+                    cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.strip() if exc.stderr else ""
+                raise RuntimeError(f"llama.cpp CLI failed with code {exc.returncode}: {stderr}") from exc
+
+        output = result.stdout or ""
+        if result.stderr:
+            logging.debug(f"[DEBUG] llama.cpp CLI stderr: {result.stderr.strip()}")
+        text = self._strip_cli_output(output, prompt)
+        if not text:
+            logging.warning("[!] llama.cpp CLI returned empty output; returning raw stdout")
+            text = output.strip()
+        return text
+
+    def name(self) -> str:
+        return "llamacpp-cli"
+
+    def supports_embeddings(self) -> bool:
+        return False
 
 class OpenAICompatBackend(BackendBase):
     def __init__(self, api_base: str, api_key: str, model_name: str, timeout: int = 120):
@@ -2014,16 +2149,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if gpu_layers_value < 0:
             logging.error("[x] --gpu-layers must be >= 0.")
             sys.exit(2)
-        try:
-            backend = LlamaCppBackend(
-                model_path=args.model_path,
-                ctx_size=args.ctx_size,
-                gpu_layers=gpu_layers_value,
-                seed=args.seed if args.seed >= 0 else None
-            )
-        except Exception as e:
-            logging.error(f"[x] Failed to initialize llama.cpp backend: {e}")
-            sys.exit(2)
+        backend: Optional[BackendBase] = None
+        backend_error: Optional[Exception] = None
+        if _HAS_LLAMA:
+            try:
+                backend = LlamaCppBackend(
+                    model_path=args.model_path,
+                    ctx_size=args.ctx_size,
+                    gpu_layers=gpu_layers_value,
+                    seed=args.seed if args.seed >= 0 else None,
+                )
+            except Exception as e:
+                backend_error = e
+                logging.warning(f"[!] llama-cpp-python backend unavailable ({e}); trying CLI fallback.")
+        if backend is None:
+            try:
+                backend = LlamaCppCliBackend(
+                    model_path=args.model_path,
+                    ctx_size=args.ctx_size,
+                    gpu_layers=gpu_layers_value,
+                    seed=args.seed if args.seed >= 0 else None,
+                )
+            except Exception as e:
+                if backend_error:
+                    logging.error(f"[x] llama.cpp python backend failed: {backend_error}")
+                logging.error(f"[x] llama.cpp CLI backend failed: {e}")
+                sys.exit(2)
         model_id = os.path.basename(args.model_path)
     else:
         try:
