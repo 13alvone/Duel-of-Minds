@@ -106,7 +106,7 @@ try {
     if (-not (Test-Path $modelsConfigPath)) {
         Write-Host "[i] Scaffolding config/models.toml" -ForegroundColor Cyan
         Ensure-Directory -Path $configDir
-        @'
+        $modelsConfigTemplate = @'
 # Duel of Minds model registry (generated)
 #
 # Each [[models]] entry maps an alias to an absolute path and the expected SHA256 checksum
@@ -117,7 +117,8 @@ try {
 alias = "example-deepseek-q5"
 path = "D:/ai/models/deepseek/deepseek-q5.gguf"
 sha256 = "replace-with-real-sha"
-'@ | Set-Content -Path $modelsConfigPath -Encoding UTF8
+'@
+        $modelsConfigTemplate | Set-Content -Path $modelsConfigPath -Encoding UTF8
     }
 
     Write-Host "[✓] llama.cpp Vulkan installation complete." -ForegroundColor Green
